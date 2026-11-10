@@ -218,3 +218,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# project: node
+node_modules/
+dist/
+.vite/
+*.local
+
+# project: data / artifacts
+data/knowledge-base.zip
+data/index/
+submission.csv
+submission.zip
