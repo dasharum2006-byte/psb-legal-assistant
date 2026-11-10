@@ -31,8 +31,8 @@ def build_context(chunks: list[dict], max_chars: int = 6000) -> str:
     # i - номер чанка,enumerate выдает пары(номер,элемент)
     for i, chunk in enumerate(chunks, 1):
         clause = chunk.get('clause', '')
-        label = "" if clause.lower().startwith("ст") else "п. "
-        header = f"[{i}] {chunk.get('doc','')}, п. {chunk.get('clause', '')}"
+        label = "" if clause.lower().startswith("ст") else "п. "
+        header = f"[{i}] {chunk.get('doc','')}, {label}{clause}"
         block = header + "\n" + chunk.get('text', '')
         if len(blocks)>0 and used + len(block)> max_chars:
             break
