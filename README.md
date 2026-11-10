@@ -49,6 +49,7 @@ git push -u origin feat/<зона>
 | `backend/app/llm/client.py`, `verifier.py` | `feat/llm-trust` | Даня |
 | `scripts/eval_demo.py`, `data/eval_*` | `feat/eval-harness` | 4-й участник |
 | `backend/app/api/*`, `frontend/*` | — | Даша (общие, изменения через PR) |
+И главный босс проекта - Илья
 
 Контракты между модулями (`retriever.search`, `llm.generate`, схема ответа) —
 в [`docs/plan.md`](docs/plan.md). Пишем против заглушек, друг друга не ждём.
