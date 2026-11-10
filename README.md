@@ -47,7 +47,7 @@ git push -u origin feat/<зона>
 | `backend/app/rag/orchestrator.py`, `docs/` | `feat/ai-orchestrator` | Даша |
 | `backend/app/rag/parser.py`, `chunker.py`, `retriever.py` | `feat/rag-retrieval` | Ярик |
 | `backend/app/llm/client.py`, `verifier.py` | `feat/llm-trust` | Даня |
-| `scripts/eval_demo.py`, `data/eval_*` | `feat/eval-harness` | 4-й участник |
+| `scripts/eval_demo.py`, `data/eval_*` | `feat/eval-harness` | Денис |
 | `backend/app/api/*`, `frontend/*` | — | Даша (общие, изменения через PR) |
 | И главный босс проекта | Нишевый Начальник💅🏻 | Илья |
 
