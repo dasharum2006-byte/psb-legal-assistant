@@ -230,3 +230,20 @@ data/knowledge-base.zip
 data/index/
 submission.csv
 submission.zip
+
+# project: секреты (правило кейса — ключи и токены в репозиторий нельзя)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+credentials.json
+secrets.*
+*.secret
+
+# project: артефакты прогонов
+data/eval_*.csv
+*.log
