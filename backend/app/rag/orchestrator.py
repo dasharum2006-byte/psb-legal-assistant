@@ -123,3 +123,26 @@ def find_date(question: str) -> str | None:
         if re.search(r"\b(год|году|г\.)", text):                                                               
             return f"{year:04d}-12-31"  
     return  None      
+
+
+
+# сортируем чанки по убыванию
+def select_chunks(chunks: list[dict], max_chars: int = 6000, max_per_doc: int = 3) -> list[dict]:              
+    """Отобрать куски под бюджет символов: по score, не больше N с документа."""                               
+    picked = []                                                                                                
+    used = 0                                                                                                   
+    per_doc = {}                                                                                               
+                                                                                                                  
+    for chunk in sorted(chunks, key=lambda chunk: chunk.get("score", 0), reverse=True):                        
+        key = chunk.get("doc_id") or chunk.get("doc") or chunk.get("title", "")                                
+        if per_doc.get(key, 0) >= max_per_doc:                                                                 
+            continue                                                                                                                                                                                                     
+        size = len(chunk.get("text", ""))                                                                      
+        if picked and used + size > max_chars:                                                                 
+            break                                                                                              
+                                                                                                                  
+        picked.append(chunk)                                                                                   
+        used += size                                                                                           
+        per_doc[key] = per_doc.get(key, 0) + 1                                                                 
+                                                                                                                  
+    return picked    
