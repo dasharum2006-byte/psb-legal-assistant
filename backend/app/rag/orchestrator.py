@@ -13,11 +13,19 @@ import calendar
 # функция analyze_query - на ее вход идет (question: str) - строка с вопросом на выходе 
 # будет словарь Python типо что то на подобие json
 # 
-def analyze_query(question: str) -> dict:
-    """v0: вытащить даты,номера договоров,названия.""" #что функция будет делать
-    ... # что возвращать
+# def analyze_query(question: str) -> dict:
+    # """v0: вытащить даты,номера договоров,названия.""" #что функция будет делать
+    # что возвращать
 #Типо - analyze_query("Какая аренданая плата?") - она вернет none
-
+def analyze_query(question: str) -> dict:                                                                      
+       """Разобрать вопрос: дата, документы, суммы, уточнение это или нет."""                                     
+       return {                                                                                                   
+           "search_query": question.strip(),                                                                      
+           "as_of": find_date(question),                                                                          
+           "doc_ids": find_doc_ids(question),                                                                     
+           "amounts": [],                                                                                         
+           "is_followup": False,                                                                                  
+       }   
 
 # chunks: list[dict] - на вход список кусков документов,каждый кусок - это словарь с полями - doc,clause,text
 # max_chars: int = 6000 - необязательный параметр если не передать то по умолчанию 6000 символов
