@@ -1,5 +1,4 @@
 """AI-оркестрация: анализ вопроса, multi-query, сборка контекста.
-
 TODO:
 - query analyzer;
 - query decomposer;
@@ -7,6 +6,9 @@ TODO:
 - dialogue memory;
 - eval harness.
 """
+
+import re
+import calendar
 #функции заглушки
 # функция analyze_query - на ее вход идет (question: str) - строка с вопросом на выходе 
 # будет словарь Python типо что то на подобие json
@@ -72,3 +74,44 @@ def find_doc_ids(question: str) -> list[str]:
         result.append("А-08/2024")
     return result
 
+MONTHS = {                                                                                                     
+    "января": 1, "январь": 1, "январе": 1,                                                                     
+    "февраля": 2, "февраль": 2, "феврале": 2,                                                                  
+    "марта": 3, "март": 3, "марте": 3,                                                                         
+    "апреля": 4, "апрель": 4, "апреле": 4,                                                                     
+    "мая": 5, "май": 5, "мае": 5,                                                                              
+    "июня": 6, "июнь": 6, "июне": 6,                                                                           
+    "июля": 7, "июль": 7, "июле": 7,                                                                           
+    "августа": 8, "август": 8, "августе": 8,                                                                   
+    "сентября": 9, "сентябрь": 9, "сентябре": 9,                                                               
+    "октября": 10, "октябрь": 10, "октябре": 10,                                                               
+    "ноября": 11, "ноябрь": 11, "ноябре": 11,                                                                  
+    "декабря": 12, "декабрь": 12, "декабре": 12,                                                               
+}     
+
+def find_date(question: str) -> str | None:
+    #приводим текст в нижнему регистру
+    text = question.lower().replace("ё","е")
+    m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", text)
+    if m:
+        day = m.group(1)
+        month = m.group(2)
+        year = m.group(3)
+        return f"{year}-{month}-{day}"
+
+    
+    m_year = re.search(r"(?<!/)\b(20\d{2})\b", text)
+    if m_year:
+        year = int(m_year.group(1))  
+        for name,number in MONTHS.items():
+            if name in text:
+                count_days = calendar.monthrange(year,number)[1]
+                return f"{year:04d}-{number:02d}-{count_days:02d}" 
+
+        for name, number in MONTHS.items():                                                                    
+               if name in text:                                                                                   
+                   count_days = calendar.monthrange(year, number)[1]                                              
+                   return f"{year:04d}-{number:02d}-{count_days:02d}"                                                                                                                                       
+        if re.search(r"\b(год|году|г\.)", text):                                                               
+            return f"{year:04d}-12-31"  
+    return  None      
