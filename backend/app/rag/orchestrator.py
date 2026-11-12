@@ -9,6 +9,13 @@ TODO:
 
 import re
 import calendar
+import os
+
+# Порог отсечения: если лучший результат поиска слабее — считаем, что
+# ничего не нашли, и отказываем вместо ответа по мусору.
+# 12 — для BM25 (нормальные вопросы дают 60-112, мусорные 4-7).
+# Если переключимся на гибрид с очками 0..1 — поставить 0.25.
+MIN_SCORE = float(os.getenv("MIN_SCORE", "12"))
 #функции заглушки
 # функция analyze_query - на ее вход идет (question: str) - строка с вопросом на выходе 
 # будет словарь Python типо что то на подобие json
@@ -146,3 +153,122 @@ def select_chunks(chunks: list[dict], max_chars: int = 6000, max_per_doc: int = 
         per_doc[key] = per_doc.get(key, 0) + 1                                                                 
                                                                                                                   
     return picked    
+
+# ─────────────────────── сборка пайплайна ───────────────────────
+
+def _adapt(chunk: dict) -> dict:
+    """Переходник: привести чанк из формата поиска к нашему."""
+    clause = str(chunk.get("clause", ""))
+    for prefix in ("п. ", "П. ", "п."):
+        if clause.startswith(prefix):
+            clause = clause[len(prefix):].strip()
+            break
+    return {
+        "doc": chunk.get("doc") or chunk.get("title", ""),
+        "doc_id": chunk.get("doc_id", ""),
+        "clause": clause,
+        "text": chunk.get("text", ""),
+        "score": float(chunk.get("score", 0)),
+        "status": chunk.get("status"),
+        "valid_from": chunk.get("valid_from"),
+        "valid_to": chunk.get("valid_to"),
+    }
+
+
+def _post_filter(chunks: list[dict], analysis: dict) -> list[dict]:
+    """Фильтры на нашей стороне: пока поиск их не поддерживает."""
+    doc_ids = [d.lower().replace("/", "-") for d in analysis.get("doc_ids") or []]
+    as_of = analysis.get("as_of")
+
+    result = []
+    for chunk in chunks:
+        if doc_ids:
+            haystack = f"{chunk['doc_id']} {chunk['doc']}".lower().replace("/", "-")
+            if not any(doc_id in haystack for doc_id in doc_ids):
+                continue
+        if as_of:
+            if chunk.get("valid_from") and chunk["valid_from"] > as_of:
+                continue
+            if chunk.get("valid_to") and chunk["valid_to"] <= as_of:
+                continue
+        result.append(chunk)
+    return result
+
+
+def _refusal(reason: str, missing: list[str] | None = None) -> dict:
+    """Обоснованный отказ: это нормальный ответ, а не ошибка."""
+    texts = {
+        "no_chunks": "В базе знаний нет документов, по которым можно ответить на этот вопрос. "
+                     "По памяти отвечать не буду: нормы могли измениться.",
+        "llm_unavailable": "Сервис ответов временно недоступен, попробуйте ещё раз.",
+        "unsupported": "Найденные документы не подтверждают такой ответ.",
+    }
+    return {
+        "answer": texts.get(reason, "Ответить не могу."),
+        "sources": [],
+        "refusal": True,
+        "missing_info": missing or ["нужны документы, которых нет в базе знаний"],
+    }
+
+
+def pick_sources(answer: str, chunks: list[dict], limit: int = 3) -> list[dict]:
+    """Оставить только те источники, на которые ответ реально ссылается."""
+    cited = [chunk for chunk in chunks if chunk["clause"] and chunk["clause"] in answer]
+    chosen = (cited or chunks)[:limit]
+    return [
+        {
+            "doc": chunk["doc"],
+            "clause": chunk["clause"],
+            "text": chunk["text"][:300],
+            "score": chunk["score"],
+        }
+        for chunk in chosen
+    ]
+
+
+def ask(question: str, history: list[dict], retriever, client=None) -> dict:
+    """Главный вход: разбор -> поиск -> отбор -> LLM -> проверка -> ответ или отказ."""
+    from app.llm.client import LLMClient
+    from app.llm.prompt import build_rag_prompt
+    from app.llm.verifier import Verifier
+
+    analysis = analyze_query(question)
+
+    # 1. поиск
+    try:
+        raw = retriever.search(analysis["search_query"], 8)
+    except Exception:
+        return _refusal("llm_unavailable")
+
+    chunks = _post_filter([_adapt(chunk) for chunk in raw], analysis)
+
+    # 2. порог: всё слабее MIN_SCORE — считаем, что не нашли
+    chunks = [chunk for chunk in chunks if chunk["score"] >= MIN_SCORE]
+    if not chunks:
+        return _refusal("no_chunks")
+
+    # 3. отбор под бюджет и склейка
+    picked = select_chunks(chunks)
+    if not picked:
+        return _refusal("no_chunks")
+
+    # 4. генерация
+    client = client or LLMClient()
+    try:
+        answer = client.generate(build_rag_prompt(question, picked))
+    except Exception:
+        return _refusal("llm_unavailable")
+
+    # 5. проверка ответа
+    verdict = Verifier.verify(answer, picked, question)
+    if not verdict.get("ok") or verdict.get("refusal"):
+        missing = verdict.get("missing_info") or verdict.get("unsupported")
+        return _refusal("unsupported", missing)
+
+    # 6. ответ
+    return {
+        "answer": answer.strip(),
+        "sources": pick_sources(answer, picked),
+        "refusal": False,
+        "missing_info": [],
+    }
