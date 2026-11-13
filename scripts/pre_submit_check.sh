@@ -79,6 +79,16 @@ else
   ok "в архиве чисто: $(unzip -Z1 submission.zip | tr '\n' ' ')"
 fi
 
+# solution.py должен лежать В КОРНЕ архива, иначе платформа его не найдёт
+if unzip -Z1 submission.zip | grep -qx "solution.py"; then
+  ok "solution.py в корне архива"
+else
+  fail "solution.py НЕ в корне — платформа не запустит решение"
+fi
+if unzip -Z1 submission.zip | grep -qE "\.zip$"; then
+  fail "внутри архива есть вложенный zip — так нельзя"
+fi
+
 rm -f data/questions.csv
 echo
 if [ "$EXIT" -eq 0 ]; then
