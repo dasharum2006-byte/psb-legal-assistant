@@ -80,6 +80,8 @@ MAX_ANSWER_CHARS = 10000
 SNIPPET_CHARS = 1400
 USE_RERANK = env("USE_RERANK", "1") == "1"
 
+_PROXY_WARNED = False
+
 REFUSAL = (
     "В предоставленной базе знаний нет документов, по которым можно ответить "
     "на этот вопрос. По памяти не отвечаю: нормы могли измениться. "
@@ -438,10 +440,14 @@ def make_client() -> httpx.Client | None:
     Если в env прописан socks-прокси без поддержки в httpx, создание
     клиента падает с ValueError. Тогда пробуем без чтения env-прокси.
     """
+    global _PROXY_WARNED
     try:
         return httpx.Client(timeout=90.0, trust_env=True)
-    except Exception as exc:
-        print(f"httpx.Client(trust_env=True): {type(exc).__name__}", file=sys.stderr)
+    except Exception:
+        if not _PROXY_WARNED:
+            print("в окружении socks-прокси, httpx его не поддерживает — "
+                  "используем http-прокси или прямое соединение", file=sys.stderr)
+            _PROXY_WARNED = True
 
     # в окружении может быть socks-прокси без поддержки в httpx;
     # тогда берём http-прокси из HTTPS_PROXY/HTTP_PROXY явно
@@ -809,6 +815,8 @@ def main() -> None:
 
     answers: list[str] = [REFUSAL] * len(rows)
 
+    shared_client = make_client() if api_available() else None
+
     def work(position: int, question: str) -> tuple[int, str]:
         if not question:
             return position, REFUSAL
@@ -816,12 +824,8 @@ def main() -> None:
         # последняя реплика пользователя + контекст предыдущих для поиска
         history, last_question = split_dialog(question)
         search_text = f"{history} {last_question}".strip() if history else last_question
-        client = make_client()
         try:
-            if client is not None:
-                with client:
-                    return position, answer_question(client, search_text, retriever)
-            return position, answer_question(None, search_text, retriever)
+            return position, answer_question(shared_client, search_text, retriever)
         except Exception as exc:
             print(f"вопрос {position}: {type(exc).__name__}: {exc}", file=sys.stderr)
             try:
@@ -836,6 +840,9 @@ def main() -> None:
             answers[position] = text
             if done % 10 == 0 or done == len(rows):
                 print(f"обработано {done}/{len(rows)}", flush=True)
+
+    if shared_client is not None:
+        shared_client.close()
 
     with open("submission.csv", "w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, quoting=csv.QUOTE_ALL, lineterminator="\n")
