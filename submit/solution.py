@@ -71,7 +71,7 @@ RERANKER_TOP_N = max(env_int("RERANKER_TOP_N", 5, 1, 8), 5)
 MAX_TOKENS = max(env_int("MAX_TOKENS", 1500, 128, 8192), 1200)
 # платформа может передать 1 поток — на 100 вопросах это упирается в лимит
 # 20 минут, поэтому держим не меньше 4
-MAX_WORKERS = max(env_int("MAX_WORKERS", 4, 1, 8), 4)
+MAX_WORKERS = max(env_int("MAX_WORKERS", 6, 1, 8), 6)
 TEMPERATURE = env_float("TEMPERATURE", 0.0)
 
 MIN_SCORE = float(env("MIN_SCORE", "6"))
@@ -84,13 +84,21 @@ SEMANTIC_STRICT = float(env("SEMANTIC_STRICT", "0.62"))
 # Платформа даёт 20 минут на весь прогон. Оставляем запас: после дедлайна
 # не зовём модели, а отдаём экстрактивные ответы — важно всегда создать
 # полный submission.csv.
-DEADLINE_SECONDS = env_int("DEADLINE_SECONDS", 900, 60, 1140)
+DEADLINE_SECONDS = env_int("DEADLINE_SECONDS", 1020, 60, 1140)
 RUN_STARTED = time.time()
 MAX_ANSWER_CHARS = 10000
 SNIPPET_CHARS = 1400
 USE_RERANK = env("USE_RERANK", "1") == "1"
 
 _PROXY_WARNED = False
+
+# Модель так говорит, когда в контексте не нашлось ответа, — тогда пробуем
+# найти документы заново по расширенному запросу.
+INSUFFICIENT = re.compile(
+    r"(нет данных|не хватает|не установлен|отсутству|не содержит|"
+    r"не удалось|не могу ответить|нет документов|нет условий|не приведен)",
+    re.I,
+)
 
 REFUSAL = (
     "В предоставленной базе знаний нет документов, по которым можно ответить "
@@ -848,6 +856,34 @@ def _ensure_citation(text: str, chunks: list[dict]) -> str:
     return f"{text.rstrip()} {_citation(chunks[0])}"
 
 
+def _second_pass(
+    client: httpx.Client, question: str, retriever: Retriever, first_selected: list[dict]
+) -> list[dict]:
+    """Повторный поиск, если первый контекст не дал ответа.
+
+    К запросу добавляем слова из названия найденного документа — так
+    находятся пункты, сформулированные иначе, чем вопрос.
+    """
+    extra = ""
+    if first_selected:
+        title_words = [w for w in first_selected[0]["doc"].split() if len(w) > 3]
+        extra = " ".join(title_words[:6])
+
+    wider = f"{expand_query(question)} {extra}".strip()
+    candidates = [c for c in retriever.search(wider, TOP_K * 2) if c["score"] > 0]
+
+    semantic, _ = semantic_candidates(client, question, retriever, k=TOP_K)
+    seen = {(c["doc"], c["clause"]) for c in candidates}
+    for chunk in semantic:
+        if (chunk["doc"], chunk["clause"]) not in seen:
+            candidates.append(chunk)
+
+    if not candidates:
+        return []
+    ordered = reorder_by_embeddings(client, question, candidates[:TOP_K * 2])
+    return rerank_chunks(client, question, ordered)
+
+
 def answer_question(client: httpx.Client | None, question: str, retriever: Retriever) -> str:
     search_text = expand_query(question)
     candidates = [chunk for chunk in retriever.search(search_text) if chunk["score"] >= MIN_SCORE]
@@ -869,8 +905,7 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
 
     # Отказ считаем по двум сигналам: если слаб и BM25, и семантика —
     # в базе действительно нет ответа (например, вопрос про пособия).
-    best_bm25 = max((chunk["score"] for chunk in candidates if chunk["score"] <= 60), default=0.0)
-    if not candidates or (best_bm25 < MIN_SCORE and semantic_best < SEMANTIC_STRICT):
+    if not candidates:
         return REFUSAL
 
     if client is not None and api_available() and time.time() - RUN_STARTED < DEADLINE_SECONDS:
@@ -880,6 +915,20 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
         text = ask_llm(client, question, selected)
         if text:
             text = _ensure_citation(text, selected)
+            if _grounded(text, selected) and not INSUFFICIENT.search(text):
+                return text
+
+            # Первый контекст не дал ответа — пробуем найти другие документы.
+            if time.time() - RUN_STARTED < DEADLINE_SECONDS * 0.9:
+                retry_selected = _second_pass(client, question, retriever, selected)
+                if retry_selected:
+                    second = ask_llm(client, question, retry_selected)
+                    if second:
+                        second = _ensure_citation(second, retry_selected)
+                        if _grounded(second, retry_selected) and not INSUFFICIENT.search(second):
+                            print("ответ получен со второй попытки поиска", file=sys.stderr)
+                            return second
+
             if _grounded(text, selected):
                 return text
             print("ответ не подтверждается контекстом, отдаём цитату", file=sys.stderr)
