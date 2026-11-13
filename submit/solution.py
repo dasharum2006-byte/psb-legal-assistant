@@ -511,7 +511,11 @@ def _grounded(answer: str, chunks: list[dict]) -> bool:
     По регламенту выдуманный факт обнуляет вопрос, поэтому лучше отдать
     цитату из документа, чем красивый, но непроверяемый ответ.
     """
-    context = " ".join(chunk["text"] for chunk in chunks).lower()
+    # в проверку включаем и шапку: модель цитирует номер пункта из неё,
+    # а не обязательно из текста
+    context = " ".join(
+        f"{chunk['doc']} {chunk['clause']} {chunk['text']}" for chunk in chunks
+    ).lower()
     context_digits = re.sub(r"\s+", "", context)
     answer_digits = re.sub(r"\s+", "", answer)
 
