@@ -70,6 +70,13 @@ MAX_WORKERS = env_int("MAX_WORKERS", 4, 1, 8)
 TEMPERATURE = env_float("TEMPERATURE", 0.0)
 
 MIN_SCORE = float(env("MIN_SCORE", "6"))
+
+# Платформа даёт 20 минут на весь прогон. Оставляем запас: после дедлайна
+# не зовём модели, а отдаём экстрактивные ответы — важно всегда создать
+# полный submission.csv.
+DEADLINE_SECONDS = env_int("DEADLINE_SECONDS", 900, 60, 1140)
+RUN_STARTED = time.time()
+MAX_ANSWER_CHARS = 10000
 SNIPPET_CHARS = 1400
 USE_RERANK = env("USE_RERANK", "1") == "1"
 
@@ -473,6 +480,58 @@ def build_prompt(question: str, chunks: list[dict]) -> str:
     return "КОНТЕКСТ:\n" + "\n\n".join(parts) + f"\n\nВОПРОС: {question}\n\nОТВЕТ:"
 
 
+def split_dialog(raw: str) -> tuple[str, str]:
+    """Разделить историю диалога и последнюю реплику пользователя.
+
+    В questions.csv вопрос может содержать несколько реплик формата
+    «Пользователь: … / Ассистент: …». Отвечать нужно на последнюю реплику,
+    но искать — с учётом предыдущих.
+    """
+    if "Пользователь:" not in raw and "пользователь:" not in raw.lower():
+        return "", raw.strip()
+
+    turns = re.split(r"(?i)(пользователь|ассистент)\s*:", raw)
+    # turns = [префикс, роль, текст, роль, текст, ...]
+    history_parts, last_user = [], ""
+    for index in range(1, len(turns) - 1, 2):
+        role = turns[index].lower()
+        text = turns[index + 1].strip()
+        if not text:
+            continue
+        if role == "пользователь":
+            last_user = text
+        history_parts.append(f"{role}: {text}")
+
+    return " ".join(history_parts[:-1]), (last_user or raw.strip())
+
+
+def _grounded(answer: str, chunks: list[dict]) -> bool:
+    """Проверка, что ответ не выдумывает: ссылки и цифры есть в контексте.
+
+    По регламенту выдуманный факт обнуляет вопрос, поэтому лучше отдать
+    цитату из документа, чем красивый, но непроверяемый ответ.
+    """
+    context = " ".join(chunk["text"] for chunk in chunks).lower()
+    context_digits = re.sub(r"\s+", "", context)
+    answer_digits = re.sub(r"\s+", "", answer)
+
+    # 1) все номера пунктов/статей из ответа должны существовать в контексте
+    for clause in re.findall(r"п\.?\s*(\d+(?:\.\d+)+)", answer):
+        if clause not in context and f"п. {clause}" not in context:
+            return False
+    for article in re.findall(r"ст\.?\s*(\d+)", answer):
+        if article not in context and f"статья {article}" not in context:
+            return False
+
+    # 2) крупные числа из ответа должны встречаться в документах
+    for number in re.findall(r"\d[\d\s]{2,}", answer):
+        clean = re.sub(r"\D", "", number)
+        if len(clean) >= 4 and clean not in context_digits:
+            return False
+
+    return True
+
+
 def _citation(chunk: dict) -> str:
     title = chunk["doc"]
     number = chunk.get("number") or ""
@@ -500,6 +559,7 @@ def ask_llm(client: httpx.Client, question: str, chunks: list[dict]) -> str | No
             choice = data["choices"][0]
             text = (choice["message"].get("content") or "").strip()
             if text:
+                text = " ".join(text.split())[:MAX_ANSWER_CHARS]
                 if choice.get("finish_reason") == "length":
                     print(f"ответ обрезан (max_tokens={budget})", file=sys.stderr)
                 return " ".join(text.split())
@@ -571,12 +631,15 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
     if not candidates:
         return REFUSAL
 
-    if client is not None and api_available():
+    if client is not None and api_available() and time.time() - RUN_STARTED < DEADLINE_SECONDS:
         ordered = reorder_by_embeddings(client, question, candidates)
         selected = rerank_chunks(client, question, ordered)
         text = ask_llm(client, question, selected)
         if text:
-            return _ensure_citation(text, selected)
+            text = _ensure_citation(text, selected)
+            if _grounded(text, selected):
+                return text
+            print("ответ не подтверждается контекстом, отдаём цитату", file=sys.stderr)
 
     return extractive_answer(question, candidates)
 
@@ -611,12 +674,16 @@ def main() -> None:
     def work(position: int, question: str) -> tuple[int, str]:
         if not question:
             return position, REFUSAL
+
+        # последняя реплика пользователя + контекст предыдущих для поиска
+        history, last_question = split_dialog(question)
+        search_text = f"{history} {last_question}".strip() if history else last_question
         client = make_client()
         try:
             if client is not None:
                 with client:
-                    return position, answer_question(client, question, retriever)
-            return position, answer_question(None, question, retriever)
+                    return position, answer_question(client, search_text, retriever)
+            return position, answer_question(None, search_text, retriever)
         except Exception as exc:
             print(f"вопрос {position}: {type(exc).__name__}: {exc}", file=sys.stderr)
             try:
