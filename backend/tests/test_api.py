@@ -1,5 +1,6 @@
 # backend/tests/test_api.py
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 from app.main import app
 from fastapi import Request
@@ -8,25 +9,27 @@ from app.api.deps import get_retriever
 
 class MockRetriever:
     """Фиктивный ретривер для тестов"""
+
     def __init__(self):
         self.name = "test-index"
-        # Структура должна точно совпадать с тем, что ждет фронт и эндпоинт
-        self.documents = [
+        # Имитируем _chunks_store для эндпоинта /documents
+        self._chunks_store = [
             {
                 "doc_id": "doc1",
-                "title": "Test Contract",
+                "title": "Договор аренды №А-08/2024",
                 "type": "contract",
-                "number": "123",
-                "date": "2024-01-01"
+                "date": "2024-01-01",
+                "status": "active"
             }
         ]
+        # Для совместимости с другими частями кода
+        self.documents = self._chunks_store
 
 
 def mock_get_retriever(request: Request):
     return MockRetriever()
 
 
-# ⚠️ КРИТИЧЕСКИ ВАЖНО: Оверрайд ДО создания клиента
 app.dependency_overrides[get_retriever] = mock_get_retriever
 
 client = TestClient(app)
@@ -54,6 +57,11 @@ def test_documents():
     assert "documents" in data
     assert isinstance(data["documents"], list)
     assert len(data["documents"]) > 0
+
+    # Проверяем наличие обязательных полей
+    first_doc = data["documents"][0]
+    assert "title" in first_doc
+    assert "doc_id" in first_doc
 
 
 @pytest.fixture(autouse=True)

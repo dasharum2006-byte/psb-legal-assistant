@@ -15,34 +15,24 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Загружаем индекс один раз при старте сервера"""
-    # Инициализируем состояние заранее, чтобы избежать AttributeError в тестах
-    app.state.retriever = None
-    app.state.index_error = "Index not loaded yet"
-
     try:
-        # retriever — это МОДУЛЬ: load_index_from_disk заполняет его
-        # внутренние переменные и ничего не возвращает, поэтому в state
-        # кладём сам модуль (у него есть .search()).
+        # Правильный импорт по инструкции ревьюера
         from app.rag import retriever as rag_retriever
 
-        # путь из .env («./data/index») считаем от корня проекта,
-        # а не от текущей папки запуска — иначе из backend/ индекс не находится
+        # «./data/index» считаем от корня проекта, а не от папки запуска:
+        # иначе при запуске из backend/ индекс не находится
         index_dir = Path(settings.INDEX_DIR)
         if not index_dir.is_absolute():
-            repo_root = Path(__file__).resolve().parents[2]
-            index_dir = repo_root / str(settings.INDEX_DIR).lstrip("./")
+            index_dir = Path(__file__).resolve().parents[2] / str(settings.INDEX_DIR).lstrip("./")
 
         logger.info(f"Loading index from {index_dir}...")
         rag_retriever.load_index_from_disk(str(index_dir))
-        if not getattr(rag_retriever, "_chunks_store", None):
-            raise RuntimeError("индекс пуст: сначала запустите scripts/build_index.py")
+
+        # Кладем в state сам модуль (у него есть .search())
         app.state.retriever = rag_retriever
         app.state.index_error = None
         logger.info("Index loaded successfully")
 
-    except ImportError:
-        logger.warning("RAG module not found. Running in API-only mode.")
-        app.state.index_error = "RAG module not implemented yet"
     except Exception as e:
         app.state.retriever = None
         app.state.index_error = str(e)
@@ -53,7 +43,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="PSB Legal Assistant API", version="0.1.0", lifespan=lifespan)
 
-# CORS из конфига
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS.split(",") if "," in settings.CORS_ORIGINS else [settings.CORS_ORIGINS],
@@ -68,16 +57,11 @@ app.include_router(documents_router, prefix="/api", tags=["documents"])
 
 @app.get("/api/health")
 def health():
-    # Безопасное получение атрибутов (для тестов и раннего старта)
     retriever = getattr(app.state, "retriever", None)
     error_msg = getattr(app.state, "index_error", "Unknown state")
 
     if retriever is not None:
-        return {
-            "status": "ok",
-            "index": "loaded",
-            "version": "0.1.0"
-        }
+        return {"status": "ok", "index": "loaded", "version": "0.1.0"}
 
     return {
         "status": "degraded",
