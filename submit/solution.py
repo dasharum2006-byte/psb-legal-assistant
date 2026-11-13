@@ -363,12 +363,25 @@ def make_client() -> httpx.Client | None:
     Если в env прописан socks-прокси без поддержки в httpx, создание
     клиента падает с ValueError. Тогда пробуем без чтения env-прокси.
     """
-    for trust_env in (True, False):
-        try:
-            return httpx.Client(timeout=90.0, trust_env=trust_env)
-        except Exception as exc:
-            print(f"httpx.Client(trust_env={trust_env}): {type(exc).__name__}", file=sys.stderr)
-    return None
+    try:
+        return httpx.Client(timeout=90.0, trust_env=True)
+    except Exception as exc:
+        print(f"httpx.Client(trust_env=True): {type(exc).__name__}", file=sys.stderr)
+
+    # в окружении может быть socks-прокси без поддержки в httpx;
+    # тогда берём http-прокси из HTTPS_PROXY/HTTP_PROXY явно
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        value = (os.getenv(name) or "").strip()
+        if value.startswith(("http://", "https://")):
+            try:
+                return httpx.Client(timeout=90.0, proxy=value)
+            except Exception:
+                continue
+
+    try:
+        return httpx.Client(timeout=90.0, trust_env=False)
+    except Exception:
+        return None
 
 
 def api_available() -> bool:
