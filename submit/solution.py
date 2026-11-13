@@ -63,9 +63,12 @@ LLM_MODEL = env("LLM_MODEL") or env("GEN_MODEL") or env("OPENAI_MODEL")
 EMB_MODEL = env("EMB_MODEL", "baai/bge-m3")
 RERANKER_MODEL = env("RERANKER_MODEL", "cohere/rerank-5-fast")
 
-TOP_K = env_int("TOP_K", 14, 1, 20)
-RERANKER_TOP_N = env_int("RERANKER_TOP_N", 5, 1, 8)
-MAX_TOKENS = env_int("MAX_TOKENS", 1500, 128, 8192)
+# Платформа передаёт свои значения (в их примере TOP_K=4, RERANKER_TOP_N=2).
+# Такие значения слишком малы: нужный пункт не доходит до модели.
+# Берём не меньше своих минимумов.
+TOP_K = max(env_int("TOP_K", 14, 1, 20), 12)
+RERANKER_TOP_N = max(env_int("RERANKER_TOP_N", 5, 1, 8), 5)
+MAX_TOKENS = max(env_int("MAX_TOKENS", 1500, 128, 8192), 1200)
 MAX_WORKERS = env_int("MAX_WORKERS", 4, 1, 8)
 TEMPERATURE = env_float("TEMPERATURE", 0.0)
 
