@@ -27,6 +27,8 @@ async def lifespan(app: FastAPI):
 
         logger.info(f"Loading index from {index_dir}...")
         rag_retriever.load_index_from_disk(str(index_dir))
+        if not getattr(rag_retriever, "_chunks_store", None):
+            raise RuntimeError("индекс пуст: сначала запустите scripts/build_index.py")
 
         # Кладем в state сам модуль (у него есть .search())
         app.state.retriever = rag_retriever
