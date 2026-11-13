@@ -36,7 +36,7 @@ class LLMClient:
             prompt: str,
             system: Optional[str] = None,
             temperature: float = 0.0,
-            max_tokens: int = 1024
+            max_tokens: Optional[int] = None
     ) -> str:
         """
         Синхронный метод генерации ответа через OpenAI-совместимый API с помощью httpx.
@@ -56,7 +56,9 @@ class LLMClient:
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens
+            # бюджет общий: токены рассуждения (если модель их тратит)
+            # тоже входят в max_tokens, поэтому по умолчанию 1500, не 1024
+            "max_tokens": max_tokens or int(os.getenv("MAX_TOKENS", "1500")),
         }
 
         # Безопасность: НИКОГДА не логируем self.api_key, prompt и system текст (персональные/юридические данные)

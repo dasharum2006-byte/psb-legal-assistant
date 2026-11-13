@@ -46,6 +46,11 @@ REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30"))
 # но на дословной сверке ответов выигрыша не дал — включать осознанно
 USE_RERANK = os.getenv("USE_RERANK", "0") == "1"
 
+# Прокси передаёт параметры как есть, поэтому токены рассуждения (если модель
+# их генерирует) входят в max_tokens. 900 может не хватить: ответ придёт
+# пустым. По умолчанию 1500,上限 8192 — как в примере организаторов.
+MAX_TOKENS = min(int(os.getenv("MAX_TOKENS", "1500")), 8192)
+
 ENDINGS = (
     "иями", "ями", "ами", "ов", "ев", "ий", "ый", "ая", "ое", "ые", "ой",
     "ей", "ам", "ям", "ах", "ях", "ию", "ия", "ью", "ом", "ем",
@@ -350,14 +355,14 @@ def ask_llm(question: str, chunks: list[dict]) -> str | None:
     payload = {
         "model": LLM_MODEL,
         "temperature": 0,
-        "max_tokens": 900,
+        "max_tokens": MAX_TOKENS,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_prompt(question, chunks)},
         ],
     }
     last_error: Exception | None = None
-    for attempt in (1, 2):                       # одна повторная попытка
+    for attempt in (1, 2, 3):                   # 3 попытки: пустой ответ -> больший бюджет
         try:
             response = httpx.post(
                 f"{LLM_BASE_URL}/chat/completions",
@@ -367,11 +372,25 @@ def ask_llm(question: str, chunks: list[dict]) -> str | None:
             )
             response.raise_for_status()
             data = response.json()
-            text = (data["choices"][0]["message"]["content"] or "").strip()
-            return text or None
+            choice = data["choices"][0]
+            text = (choice["message"].get("content") or "").strip()
+
+            finish = choice.get("finish_reason")
+            if not text:
+                # модель израсходовала бюджет на рассуждения
+                print(f"  ! пустой ответ (finish_reason={finish}), "
+                      f"пробуем max_tokens={min(payload['max_tokens'] * 2, 8192)}", file=sys.stderr)
+                if payload["max_tokens"] < 8192:
+                    payload["max_tokens"] = min(payload["max_tokens"] * 2, 8192)
+                    continue
+                return None
+
+            if finish == "length":
+                print(f"  ! ответ обрезан по max_tokens={payload['max_tokens']}", file=sys.stderr)
+            return text
         except Exception as exc:                 # сеть / прокси / формат ответа
             last_error = exc
-            if attempt == 1:
+            if attempt < 3:
                 time.sleep(1.5)
 
     print(f"  ! LLM недоступна ({type(last_error).__name__}), используем цитату", file=sys.stderr)
