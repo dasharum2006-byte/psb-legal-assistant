@@ -1,5 +1,6 @@
 # backend/app/main.py
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -15,13 +16,22 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Загружаем индекс один раз при старте сервера"""
     try:
-        # Правильный импорт по инструкции ревьюера
+        # retriever — это МОДУЛЬ: load_index_from_disk заполняет его
+        # внутренние переменные и ничего не возвращает, поэтому в state
+        # кладём сам модуль (у него есть .search()).
         from app.rag import retriever as rag_retriever
 
-        logger.info(f"Loading index from {settings.INDEX_DIR}...")
-        rag_retriever.load_index_from_disk(settings.INDEX_DIR)
+        # путь из .env («./data/index») считаем от корня проекта,
+        # а не от текущей папки запуска — иначе из backend/ индекс не находится
+        index_dir = Path(settings.INDEX_DIR)
+        if not index_dir.is_absolute():
+            repo_root = Path(__file__).resolve().parents[2]
+            index_dir = repo_root / str(settings.INDEX_DIR).lstrip("./")
 
-        # Кладем в state сам модуль (у него есть .search())
+        logger.info(f"Loading index from {index_dir}...")
+        rag_retriever.load_index_from_disk(str(index_dir))
+        if not getattr(rag_retriever, "_chunks_store", None):
+            raise RuntimeError("индекс пуст: сначала запустите scripts/build_index.py")
         app.state.retriever = rag_retriever
         app.state.index_error = None
         logger.info("Index loaded successfully")

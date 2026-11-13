@@ -4,4 +4,5 @@ pydantic==2.14.2
 python-dotenv==1.1.1
 httpx==0.28.1
 pydantic-settings>=2.0.0
+rank_bm25
 pytest>=7.4.0

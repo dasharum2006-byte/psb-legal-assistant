@@ -69,12 +69,12 @@ async def chat_endpoint(
     start_time = time.time()
 
     try:
-        # ПОДКЛЮЧЕНИЕ РЕАЛЬНОГО ПЛАЙПЛАЙНА (раскомментировано по просьбе ревьюера)
         from app.rag.orchestrator import ask
 
+        # ask() синхронный: уводим в поток, чтобы не блокировать event loop
         result = await asyncio.wait_for(
-            ask(request.message, request.history, retriever),
-            timeout=settings.REQUEST_TIMEOUT
+            asyncio.to_thread(ask, request.message, request.history, retriever),
+            timeout=settings.REQUEST_TIMEOUT,
         )
 
         latency_ms = round((time.time() - start_time) * 1000, 2)
