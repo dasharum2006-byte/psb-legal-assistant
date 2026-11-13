@@ -42,6 +42,9 @@ LLM_BASE_URL = (os.getenv("LLM_BASE_URL") or "").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY") or ""
 LLM_MODEL = os.getenv("LLM_MODEL") or ""
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30"))
+# реранкер: по замерам поднимает попадание нужного пункта в top-3 (6->7 из 17),
+# но на дословной сверке ответов выигрыша не дал — включать осознанно
+USE_RERANK = os.getenv("USE_RERANK", "0") == "1"
 
 ENDINGS = (
     "иями", "ями", "ами", "ов", "ев", "ий", "ый", "ая", "ое", "ые", "ой",
@@ -253,6 +256,52 @@ def _citation(chunk: dict) -> str:
     return f"({title}{suffix}, п. {chunk['clause']})"
 
 
+def rerank(question: str, chunks: list[dict], retriever: "Retriever") -> list[dict]:
+    """Переупорядочить найденное: важнее покрытие РЕДКИХ слов вопроса.
+
+    BM25 хорошо находит документ, но внутри документа путает пункты.
+    Здесь считаем, какую долю «веса» слов вопроса покрывает кусок.
+    """
+    if not chunks:
+        return chunks
+
+    wanted = significant_tokens(question)
+    if not wanted:
+        return chunks
+
+    idf = getattr(retriever.bm25, "idf", {}) or {}
+    default_idf = max(1.0, sum(idf.values()) / len(idf)) if idf else 1.0
+    total_weight = sum(max(idf.get(stem_, default_idf), 0.01) for stem_ in wanted) or 1.0
+
+    question_low = question.lower()
+    best_score = max(chunk["score"] for chunk in chunks) or 1.0
+
+    for chunk in chunks:
+        have = significant_tokens(chunk["searchable"])
+        matched = wanted & have
+        weight = sum(max(idf.get(stem_, default_idf), 0.01) for stem_ in matched)
+        coverage = weight / total_weight
+
+        bonus = 0.0
+        clause = str(chunk.get("clause", "")).replace("ст.", "").replace("п.", "").strip()
+        if clause and clause in question_low:
+            bonus += 0.15                      # в вопросе прямо назван пункт
+
+        title_words = significant_tokens(chunk.get("doc", "")) - {
+            "договор", "поставк", "аренд", "регламент", "статья", "помещен"
+        }
+        if title_words and len(title_words & wanted) / len(title_words) >= 0.5:
+            bonus += 0.10                      # вопрос явно про этот документ
+
+        penalty = min(0.10, len(chunk.get("text", "")) / 20000)   # штраф за размер
+
+        chunk["rerank_score"] = (
+            0.5 * (chunk["score"] / best_score) + 0.5 * coverage + bonus - penalty
+        )
+
+    return sorted(chunks, key=lambda item: -item["rerank_score"])
+
+
 def relevant(question: str, results: list[dict]) -> list[dict]:
     """Оставляем только то, где реально совпали значимые слова вопроса."""
     if not results:
@@ -379,6 +428,8 @@ def extractive_answer(question: str, chunks: list[dict]) -> str:
 
 def answer(question: str, retriever: Retriever) -> str:
     results = [c for c in retriever.search(question) if c["score"] >= MIN_SCORE]
+    if USE_RERANK:
+        results = rerank(question, results, retriever)
     results = relevant(question, results)
     if not results:
         return REFUSAL
