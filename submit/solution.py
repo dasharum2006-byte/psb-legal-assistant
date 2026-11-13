@@ -27,6 +27,7 @@ import csv
 import os
 import re
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -278,25 +279,32 @@ def ask_llm(question: str, chunks: list[dict]) -> str | None:
     payload = {
         "model": LLM_MODEL,
         "temperature": 0,
-        "max_tokens": 700,
+        "max_tokens": 900,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_prompt(question, chunks)},
         ],
     }
-    try:
-        response = httpx.post(
-            f"{LLM_BASE_URL}/chat/completions",
-            json=payload,
-            headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return (data["choices"][0]["message"]["content"] or "").strip() or None
-    except Exception as exc:                     # сеть/прокси/формат ответа
-        print(f"  ! LLM недоступна ({type(exc).__name__}), используем цитату", file=sys.stderr)
-        return None
+    last_error: Exception | None = None
+    for attempt in (1, 2):                       # одна повторная попытка
+        try:
+            response = httpx.post(
+                f"{LLM_BASE_URL}/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+            text = (data["choices"][0]["message"]["content"] or "").strip()
+            return text or None
+        except Exception as exc:                 # сеть / прокси / формат ответа
+            last_error = exc
+            if attempt == 1:
+                time.sleep(1.5)
+
+    print(f"  ! LLM недоступна ({type(last_error).__name__}), используем цитату", file=sys.stderr)
+    return None
 
 
 def _pick_sentences(chunk: dict, wanted: set[str], limit: int = 320) -> str:
@@ -355,8 +363,15 @@ def answer(question: str, retriever: Retriever) -> str:
 
     text = ask_llm(question, results)
     if text:
-        return text
+        return _ensure_citation(text, results)
     return extractive_answer(question, results)
+
+
+def _ensure_citation(text: str, chunks: list[dict]) -> str:
+    """LLM-судья ценит обоснованность: без ссылки на пункт ответ не оставляем."""
+    if re.search(r"\(\s*(п\.|пункт|ст\.|статья|ч\.)", text, re.I):
+        return text
+    return f"{text.rstrip()} {_citation(chunks[0])}"
 
 
 # ─────────────────────── main ───────────────────────
@@ -386,6 +401,10 @@ def main() -> None:
     refused = 0
     for row in rows:
         question = (row.get("question") or row.get("text") or "").strip()
+        if not question:
+            answers.append((row.get("id", ""), REFUSAL))
+            refused += 1
+            continue
         try:
             text = answer(question, retriever)
         except Exception as exc:
