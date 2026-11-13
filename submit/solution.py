@@ -63,8 +63,8 @@ LLM_MODEL = env("LLM_MODEL") or env("GEN_MODEL") or env("OPENAI_MODEL")
 EMB_MODEL = env("EMB_MODEL", "baai/bge-m3")
 RERANKER_MODEL = env("RERANKER_MODEL", "cohere/rerank-5-fast")
 
-TOP_K = env_int("TOP_K", 8, 1, 20)
-RERANKER_TOP_N = env_int("RERANKER_TOP_N", 3, 1, 8)
+TOP_K = env_int("TOP_K", 14, 1, 20)
+RERANKER_TOP_N = env_int("RERANKER_TOP_N", 5, 1, 8)
 MAX_TOKENS = env_int("MAX_TOKENS", 1500, 128, 8192)
 MAX_WORKERS = env_int("MAX_WORKERS", 4, 1, 8)
 TEMPERATURE = env_float("TEMPERATURE", 0.0)
@@ -419,6 +419,44 @@ def reorder_by_embeddings(client: httpx.Client, question: str, chunks: list[dict
         return chunks
 
 
+def with_neighbours(selected: list[dict], all_chunks: list[dict], limit: int = 2) -> list[dict]:
+    """Добавить соседние пункты того же документа.
+
+    Вопрос часто требует двух пунктов («плата И срок оплаты»), а поиск
+    приносит один. Соседи по номеру пункта закрывают такие случаи.
+    """
+    if not selected:
+        return selected
+
+    def numeric(clause: str) -> float | None:
+        match = re.fullmatch(r"\d+(?:\.\d+)*", str(clause).strip())
+        return float(match.group(0)) if match else None
+
+    added: list[dict] = []
+    seen = {(chunk["doc"], chunk["clause"]) for chunk in selected}
+
+    for chunk in selected:
+        base = numeric(chunk["clause"])
+        if base is None:
+            continue
+        for candidate in all_chunks:
+            if len(added) >= limit:
+                break
+            if candidate["doc"] != chunk["doc"]:
+                continue
+            value = numeric(candidate["clause"])
+            if value is None:
+                continue
+            key = (candidate["doc"], candidate["clause"])
+            if key in seen:
+                continue
+            if abs(value - base) <= 0.11:      # соседний пункт: 3.1 <-> 3.2
+                seen.add(key)
+                added.append(candidate)
+
+    return selected + added
+
+
 def rerank_chunks(client: httpx.Client, question: str, chunks: list[dict]) -> list[dict]:
     """Финальный отбор через /rerank."""
     if not chunks or not USE_RERANK:
@@ -553,7 +591,11 @@ def _citation(chunk: dict) -> str:
     title = chunk["doc"]
     number = chunk.get("number") or ""
     suffix = "" if not number or number.replace("№", "").strip() in title else f" № {number}"
-    return f"({title}{suffix}, п. {chunk['clause']})"
+    clause = str(chunk["clause"]).strip()
+
+    # для статей и абзацев приставка «п.» не нужна
+    prefix = "" if clause.startswith(("ст.", "абз.")) else "п. "
+    return f"({title}{suffix}, {prefix}{clause})"
 
 
 def ask_llm(client: httpx.Client, question: str, chunks: list[dict]) -> str | None:
@@ -651,6 +693,7 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
     if client is not None and api_available() and time.time() - RUN_STARTED < DEADLINE_SECONDS:
         ordered = reorder_by_embeddings(client, question, candidates)
         selected = rerank_chunks(client, question, ordered)
+        selected = with_neighbours(selected, retriever.chunks)
         text = ask_llm(client, question, selected)
         if text:
             text = _ensure_citation(text, selected)
