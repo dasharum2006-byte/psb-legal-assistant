@@ -650,7 +650,7 @@ def rerank_chunks(client: httpx.Client, question: str, chunks: list[dict]) -> li
 SYSTEM_PROMPT = (
     "Ты юридический ассистент компании. Отвечай ТОЛЬКО по фрагментам документов из блока КОНТЕКСТ.\n"
     "\n"
-    "ФОРМАТ ОТВЕТА: максимум 3 предложения и не более 400 символов. "
+    "ФОРМАТ ОТВЕТА: 2-4 предложения, до 500 символов. "
     "Начни с прямого ответа: «Да», «Нет» или сам факт.\n"
     "\n"
     "ССЫЛКИ — обязательны для каждого факта:\n"
@@ -910,9 +910,18 @@ def main() -> None:
         reader = csv.DictReader(handle)
         rows = [(str(row.get("id", "")).strip(), (row.get("question") or "").strip()) for row in reader]
 
-    mode = "LLM + эмбеддинги + rerank" if api_available() else "цитаты (без API)"
-    print(f"документов: {len(documents)}, чанков: {len(chunks)}, "
-          f"вопросов: {len(rows)}, режим: {mode}", flush=True)
+    if api_available():
+        mode = "LLM + эмбеддинги + rerank"
+    else:
+        missing = []
+        if not API_BASE:
+            missing.append("LLM_BASE_URL/BASE_URL/OPENAI_BASE_URL")
+        if not LLM_KEY:
+            missing.append("LLM_API_KEY/OPENAI_API_KEY")
+        mode = f"ЦИТАТЫ (без API: не задано {', '.join(missing)})"
+    print(f"[DIAG] документов={len(documents)} чанков={len(chunks)} "
+          f"вопросов={len(rows)} TOP_K={TOP_K} TOP_N={RERANKER_TOP_N} "
+          f"workers={MAX_WORKERS} model={LLM_MODEL or '-'} режим={mode}", flush=True)
 
     answers: list[str] = [REFUSAL] * len(rows)
 
@@ -952,7 +961,9 @@ def main() -> None:
             writer.writerow([question_id, text])
 
     refused = sum(1 for text in answers if text == REFUSAL)
-    print(f"submission.csv готов: {len(answers)} ответов, отказов: {refused}", flush=True)
+    cited = sum(1 for text in answers if re.search(r"(п\.|ст\.|абз\.)", text))
+    print(f"[DIAG] готово: {len(answers)} ответов, отказов={refused}, "
+          f"со_ссылкой={cited}, режим={'LLM' if api_available() else 'цитаты'}", flush=True)
 
 
 if __name__ == "__main__":
