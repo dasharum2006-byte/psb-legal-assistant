@@ -141,8 +141,10 @@ def stem(word: str) -> str:
 
 
 def tokenize(text: str) -> list[str]:
+    """Токены для BM25. Обязательно со стеммингом: иначе «претензию» и
+    «претензии» для поиска разные слова, и нужный пункт не находится."""
     words = re.findall(r"[а-яa-z0-9-]+", text.lower().replace("ё", "е"))
-    return [w for w in words if w not in STOP_WORDS and len(w) > 1]
+    return [stem(w) for w in words if w not in STOP_WORDS and len(w) > 1]
 
 
 def expand_query(question: str) -> str:
@@ -156,7 +158,7 @@ def expand_query(question: str) -> str:
 
 
 def significant_tokens(text: str) -> set[str]:
-    return {stem(w) for w in tokenize(text)}
+    return set(tokenize(text))
 
 
 # ─────────────────────── документы ───────────────────────
@@ -358,6 +360,37 @@ class Retriever:
 
     def search(self, question: str, k: int = TOP_K) -> list[dict]:
         scores = self.bm25.get_scores(tokenize(question))
+
+        # Буст по упоминанию документа в вопросе: номер договора или
+        # название контрагента. Иначе нужный пункт остаётся на 15-25 месте,
+        # и ни реранкер, ни модель его не увидят.
+        low_question = question.lower().replace("ё", "е")
+        number_markers = [
+            marker.lower().replace("№", "").strip()
+            for marker in re.findall(r"№\s*[А-ЯA-Z0-9][А-ЯA-Z0-9./\-]*", question)
+        ]
+        titles_cache: dict[str, set[str]] = {}
+        for index, chunk in enumerate(self.chunks):
+            title = chunk["doc"]
+            if title not in titles_cache:
+                titles_cache[title] = significant_tokens(title)
+
+            bonus = 0.0
+            title_low = title.lower().replace("ё", "е")
+
+            # 1) номер документа из вопроса есть в названии
+            for marker in number_markers:
+                if marker and marker in title_low.replace("/", "-"):
+                    bonus += 15.0
+                    break
+
+            # 2) редкие слова названия документа встречаются в вопросе
+            matched = titles_cache[title] & significant_tokens(low_question)
+            if matched:
+                bonus += 3.0 * len(matched)
+
+            if bonus:
+                scores[index] += bonus
         order = sorted(range(len(self.chunks)), key=lambda i: -scores[i])[:k]
         results = []
         for index in order:
