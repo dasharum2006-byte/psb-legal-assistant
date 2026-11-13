@@ -36,7 +36,7 @@ from rank_bm25 import BM25Okapi
 # ─────────────────────── настройки ───────────────────────
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
-TOP_K = int(os.getenv("TOP_K", "5"))
+TOP_K = int(os.getenv("TOP_K", "8"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "6"))
 LLM_BASE_URL = (os.getenv("LLM_BASE_URL") or "").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY") or ""
@@ -159,15 +159,37 @@ def chunk_documents(documents: list[dict]) -> list[dict]:
                 produced.append({"clause": clause, "text": piece, "kind": "article"})
 
         if not produced:
-            for number, block in enumerate(re.split(r"\n\s*\n", text), 1):
+            number = 0
+            for block in re.split(r"\n\s*\n", text):
                 block = re.sub(r"\s+", " ", block).strip()
                 if len(block) < 30 or block.lower().startswith(("источник:", "url:", "дата выгрузки:")):
                     continue
-                produced.append({"clause": f"абз. {number}", "text": block, "kind": "paragraph"})
+                # длинные абзацы режем по предложениям: иначе такой кусок
+                # перебивает точные пункты договоров
+                for piece in _split_sentences(block, limit=450):
+                    number += 1
+                    produced.append({"clause": f"абз. {number}", "text": piece, "kind": "paragraph"})
 
         chunks.extend(_decorate(doc, produced))
 
     return chunks
+
+
+def _split_sentences(block: str, limit: int = 450) -> list[str]:
+    """Резать длинный абзац по границам предложений."""
+    if len(block) <= limit:
+        return [block]
+    sentences = [s.strip() for s in re.split(r"(?<=[.;!?])\s+", block) if s.strip()]
+    pieces, current = [], ""
+    for sentence in sentences:
+        if current and len(current) + len(sentence) + 1 > limit:
+            pieces.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip()
+    if current:
+        pieces.append(current)
+    return [piece for piece in pieces if len(piece) >= 30]
 
 
 def _split_long(body: str, limit: int = 1500) -> list[str]:
