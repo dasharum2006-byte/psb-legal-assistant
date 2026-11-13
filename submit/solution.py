@@ -91,6 +91,32 @@ ENDINGS = (
     "ей", "ам", "ям", "ах", "ях", "ию", "ия", "ью", "ом", "ем",
     "а", "я", "ы", "и", "о", "е", "у", "ю", "ь",
 )
+# Пары «как спрашивают» -> «как написано в документах».
+# Общие юридические соответствия, без привязки к конкретным документам.
+QUERY_SYNONYMS = {
+    "аванс": "предоплат",
+    "предоплат": "аванс",
+    "ноч": "круглосуточ доступ",
+    "круглосуточ": "доступ беспрепятственн",
+    "оплат": "платеж расчет стоимость",
+    "платеж": "оплат расчет",
+    "срок": "период дней",
+    "гарант": "гарантийн",
+    "приемк": "акт качество",
+    "приёмк": "акт качество",
+    "доставк": "упаковк перевозк",
+    "упаковк": "доставк",
+    "одобрен": "согласован генеральн директор",
+    "согласован": "одобрен",
+    "испытан": "испытательн",
+    "расторжен": "прекращен увольнен",
+    "уволен": "расторжен прекращен",
+    "хранен": "архив срок",
+    "выдач": "выдава оригинал архив",
+    "претенз": "претензи акт недостатк",
+    "недостат": "дефект претензи качеств",
+}
+
 STOP_WORDS = {
     "и", "в", "на", "по", "с", "не", "что", "как", "это", "а", "но", "или",
     "для", "из", "от", "до", "за", "то", "же", "бы", "ли", "при", "над",
@@ -102,15 +128,31 @@ STOP_WORDS = {
 # ─────────────────────── текст ───────────────────────
 
 def stem(word: str) -> str:
+    """Грубая основа слова: отсечь окончание и обрезать до корня.
+
+    Обрезка нужна, потому что русские окончания дают разные формы одного
+    слова: «гарантию» и «гарантийный» должны совпасть.
+    """
     for ending in ENDINGS:
         if word.endswith(ending) and len(word) - len(ending) >= 4:
-            return word[: -len(ending)]
-    return word
+            word = word[: -len(ending)]
+            break
+    return word[:6] if len(word) > 6 else word
 
 
 def tokenize(text: str) -> list[str]:
     words = re.findall(r"[а-яa-z0-9-]+", text.lower().replace("ё", "е"))
     return [w for w in words if w not in STOP_WORDS and len(w) > 1]
+
+
+def expand_query(question: str) -> str:
+    """Добавить к запросу слова, которые встречаются в документах."""
+    low = question.lower().replace("ё", "е")
+    extra = []
+    for stem_key, words in QUERY_SYNONYMS.items():
+        if stem_key in low:
+            extra.append(words)
+    return f"{question} {' '.join(extra)}" if extra else question
 
 
 def significant_tokens(text: str) -> set[str]:
@@ -685,8 +727,11 @@ def _ensure_citation(text: str, chunks: list[dict]) -> str:
 
 
 def answer_question(client: httpx.Client | None, question: str, retriever: Retriever) -> str:
-    candidates = [chunk for chunk in retriever.search(question) if chunk["score"] >= MIN_SCORE]
-    candidates = relevant(question, candidates)
+    search_text = expand_query(question)
+    candidates = [chunk for chunk in retriever.search(search_text) if chunk["score"] >= MIN_SCORE]
+    filtered = relevant(question, candidates)
+    if len(filtered) >= 3:
+        candidates = filtered
     if not candidates:
         return REFUSAL
 
