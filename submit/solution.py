@@ -75,6 +75,11 @@ MAX_WORKERS = max(env_int("MAX_WORKERS", 4, 1, 8), 4)
 TEMPERATURE = env_float("TEMPERATURE", 0.0)
 
 MIN_SCORE = float(env("MIN_SCORE", "6"))
+# порог косинусной близости для семантики: ниже него считаем, что по смыслу
+# ничего не подходит (например, вопрос про пособия, которых нет в базе)
+SEMANTIC_MIN = float(env("SEMANTIC_MIN", "0.45"))
+# ниже этого косинуса считаем, что по смыслу тоже ничего нет
+SEMANTIC_STRICT = float(env("SEMANTIC_STRICT", "0.62"))
 
 # Платформа даёт 20 минут на весь прогон. Оставляем запас: после дедлайна
 # не зовём модели, а отдаём экстрактивные ответы — важно всегда создать
@@ -474,6 +479,78 @@ def api_available() -> bool:
     return bool(API_BASE and LLM_KEY)
 
 
+_EMBEDDING_CACHE: dict[str, list[float]] = {}
+
+
+def _embed(client: httpx.Client, texts: list[str]) -> list[list[float]] | None:
+    """Векторы через /embeddings, с кэшем и батчами по 64 текста."""
+    result: list[list[float] | None] = [None] * len(texts)
+    pending: list[tuple[int, str]] = []
+
+    for index, text in enumerate(texts):
+        cached = _EMBEDDING_CACHE.get(text)
+        if cached is not None:
+            result[index] = cached
+        else:
+            pending.append((index, text))
+
+    try:
+        for start in range(0, len(pending), 64):
+            batch = pending[start:start + 64]
+            response = _post(client, "/embeddings", EMBED_KEY, {
+                "model": EMB_MODEL,
+                "input": [text for _, text in batch],
+                "encoding_format": "float",
+            })
+            for position, item in enumerate(response["data"]):
+                vector = [float(x) for x in item["embedding"]]
+                norm = math.sqrt(sum(x * x for x in vector)) or 1.0
+                vector = [x / norm for x in vector]
+                index = batch[int(item.get("index", position))][0]
+                result[index] = vector
+                _EMBEDDING_CACHE[batch[int(item.get("index", position))][1]] = vector
+    except Exception as exc:
+        print(f"эмбеддинги недоступны ({type(exc).__name__})", file=sys.stderr)
+        return None
+
+    if any(vector is None for vector in result):
+        return None
+    return result  # type: ignore[return-value]
+
+
+def semantic_candidates(
+    client: httpx.Client, question: str, retriever: "Retriever", k: int = 12
+) -> tuple[list[dict], float]:
+    """Независимый поиск по смыслу: эмбеддинги вопроса против всех чанков.
+
+    Возвращает (кандидаты, лучший косинус) — второй нужен, чтобы отличить
+    «ничего не подходит» от «подходит».
+    """
+    if not api_available():
+        return [], 0.0
+    try:
+        question_vector = _embed(client, [question])
+        chunk_vectors = _embed(client, [chunk["searchable"][:1200] for chunk in retriever.chunks])
+        if not question_vector or not chunk_vectors:
+            return [], 0.0
+        query = question_vector[0]
+        scored = [
+            (sum(a * b for a, b in zip(query, vector)), chunk)
+            for vector, chunk in zip(chunk_vectors, retriever.chunks)
+        ]
+        scored.sort(key=lambda pair: -pair[0])
+        best = float(scored[0][0]) if scored else 0.0
+        picked = []
+        for score, chunk in [pair for pair in scored[:k] if pair[0] >= SEMANTIC_MIN]:
+            item = dict(chunk)
+            item["score"] = float(score) * 10.0      # приводим к масштабу BM25
+            picked.append(item)
+        return picked, best
+    except Exception as exc:
+        print(f"семантический поиск недоступен ({type(exc).__name__})", file=sys.stderr)
+        return [], 0.0
+
+
 def reorder_by_embeddings(client: httpx.Client, question: str, chunks: list[dict]) -> list[dict]:
     """Переупорядочить кандидатов по косинусной близости эмбеддингов."""
     if not chunks:
@@ -573,7 +650,8 @@ def rerank_chunks(client: httpx.Client, question: str, chunks: list[dict]) -> li
 SYSTEM_PROMPT = (
     "Ты юридический ассистент компании. Отвечай ТОЛЬКО по фрагментам документов из блока КОНТЕКСТ.\n"
     "\n"
-    "ФОРМАТ ОТВЕТА: 2-4 предложения (150-400 символов). Начни с прямого ответа: «Да», «Нет» или сам факт.\n"
+    "ФОРМАТ ОТВЕТА: максимум 3 предложения и не более 400 символов. "
+    "Начни с прямого ответа: «Да», «Нет» или сам факт.\n"
     "\n"
     "ССЫЛКИ — обязательны для каждого факта:\n"
     "  - договоры и внутренние документы: (п. 3.1) в конце предложения;\n"
@@ -773,12 +851,26 @@ def _ensure_citation(text: str, chunks: list[dict]) -> str:
 def answer_question(client: httpx.Client | None, question: str, retriever: Retriever) -> str:
     search_text = expand_query(question)
     candidates = [chunk for chunk in retriever.search(search_text) if chunk["score"] >= MIN_SCORE]
+
+    # гибрид: добавляем кандидатов, найденных по смыслу (независимо от слов)
+    semantic: list[dict] = []
+    semantic_best = 0.0
+    if client is not None:
+        semantic, semantic_best = semantic_candidates(client, question, retriever)
+
+    if semantic:
+        seen = {(chunk["doc"], chunk["clause"]) for chunk in candidates}
+        for chunk in semantic:
+            if (chunk["doc"], chunk["clause"]) not in seen:
+                candidates.append(chunk)
     filtered = relevant(question, candidates)
     if len(filtered) >= 3:
         candidates = filtered
 
-    if not candidates:
-        # ничего не нашли даже по словам — тут отказ честен
+    # Отказ считаем по двум сигналам: если слаб и BM25, и семантика —
+    # в базе действительно нет ответа (например, вопрос про пособия).
+    best_bm25 = max((chunk["score"] for chunk in candidates if chunk["score"] <= 60), default=0.0)
+    if not candidates or (best_bm25 < MIN_SCORE and semantic_best < SEMANTIC_STRICT):
         return REFUSAL
 
     if client is not None and api_available() and time.time() - RUN_STARTED < DEADLINE_SECONDS:
