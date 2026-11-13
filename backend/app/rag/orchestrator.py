@@ -15,7 +15,26 @@ import os
 # ничего не нашли, и отказываем вместо ответа по мусору.
 # 12 — для BM25 (нормальные вопросы дают 60-112, мусорные 4-7).
 # Если переключимся на гибрид с очками 0..1 — поставить 0.25.
-MIN_SCORE = float(os.getenv("MIN_SCORE", "12"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "8"))
+
+# Доменные подсказки: слова из вопроса -> слова из документов.
+# Нужны, потому что люди говорят «платить», а в договоре «арендная плата».
+SYNONYMS = {
+    "плат": "оплата плата арендная стоимость",
+    "ноч": "круглосуточно доступ беспрепятственный транспорт",
+    "круглосуточ": "круглосуточно доступ транспорт",
+    "ключ": "акт возврат помещения приёмка",
+    "архив": "записка оригинал выдача юо-7",
+    "оригинал": "оригинал архив выдача юо-7",
+    "гарант": "гарантия гарантийный срок качество",
+    "компьютер": "компьютерная техника оборудование",
+    "мебел": "мебель оборудование",
+    "испытан": "испытание испытательный срок",
+    "претенз": "претензия акт недостатки дефекты",
+    "аванс": "предоплата аванс оплата",
+    "санкц": "санкционная проверка комплаенс чек-лист",
+    "хранен": "хранение архив срок",
+}
 #функции заглушки
 # функция analyze_query - на ее вход идет (question: str) - строка с вопросом на выходе 
 # будет словарь Python типо что то на подобие json
@@ -24,10 +43,34 @@ MIN_SCORE = float(os.getenv("MIN_SCORE", "12"))
     # """v0: вытащить даты,номера договоров,названия.""" #что функция будет делать
     # что возвращать
 #Типо - analyze_query("Какая аренданая плата?") - она вернет none
+def contextual_query(question: str, history: list[dict] | None) -> str:
+    """Для уточняющих вопросов подмешать предыдущий вопрос пользователя.
+
+    Вопросы 6 и 15-18 кейса — это диалоги. Фраза «А за сколько дней после
+    поставки?» без предыдущего вопроса не содержит ни договора, ни темы.
+    """
+    if not history:
+        return question
+
+    previous = [m.get("text", "") for m in history if m.get("role") == "user" and m.get("text")]
+    if not previous:
+        return question
+
+    short = len(question.split()) <= 10 or question.strip().lower().startswith(("а ", "и ", "тогда"))
+    return f"{previous[-1]} {question}" if short else question
+
+
+def expand_query(question: str) -> str:
+    """Добавить к вопросу слова из документов (доменные синонимы)."""
+    low = question.lower().replace("ё", "е")
+    extra = [words for stem, words in SYNONYMS.items() if stem in low]
+    return f"{question.strip()} {' '.join(extra)}" if extra else question.strip()
+
+
 def analyze_query(question: str) -> dict:                                                                      
        """Разобрать вопрос: дата, документы, суммы, уточнение это или нет."""                                     
        return {                                                                                                   
-           "search_query": question.strip(),                                                                      
+           "search_query": expand_query(question),                                                                      
            "as_of": find_date(question),                                                                          
            "doc_ids": find_doc_ids(question),                                                                     
            "amounts": [],                                                                                         
@@ -232,7 +275,7 @@ def ask(question: str, history: list[dict], retriever, client=None) -> dict:
     from app.llm.prompt import build_rag_prompt
     from app.llm.verifier import Verifier
 
-    analysis = analyze_query(question)
+    analysis = analyze_query(contextual_query(question, history))
 
     # 1. поиск
     try:
