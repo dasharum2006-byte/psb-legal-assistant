@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import math
 import os
 import re
 import sys
 import time
+import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -439,9 +441,30 @@ def relevant(question: str, results: list[dict]) -> list[dict]:
 
 # ─────────────────────── API платформы ───────────────────────
 
-def _post(client: httpx.Client, path: str, key: str, payload: dict) -> dict:
+def _post_urllib(path: str, key: str, payload: dict) -> dict:
+    """Резервный путь через стандартную библиотеку.
+
+    Нужен, если httpx не смог создать клиент (например, из-за socks-прокси
+    в окружении). Без этого все ответы деградируют до цитат.
+    """
+    request = urllib.request.Request(
+        API_BASE + path,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=90) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _post(client, path: str, key: str, payload: dict) -> dict:
     if not key:
         raise ValueError("нет API-ключа")
+    if client is None:
+        return _post_urllib(path, key, payload)
     response = client.post(
         API_BASE + path,
         headers={"Authorization": f"Bearer {key}"},
@@ -484,6 +507,7 @@ def make_client() -> httpx.Client | None:
 
 
 def api_available() -> bool:
+    # клиент может быть None (httpx не смог) — тогда пойдём через urllib
     return bool(API_BASE and LLM_KEY)
 
 
@@ -891,7 +915,7 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
     # гибрид: добавляем кандидатов, найденных по смыслу (независимо от слов)
     semantic: list[dict] = []
     semantic_best = 0.0
-    if client is not None:
+    if api_available():
         semantic, semantic_best = semantic_candidates(client, question, retriever)
 
     if semantic:
@@ -908,7 +932,7 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
     if not candidates:
         return REFUSAL
 
-    if client is not None and api_available() and time.time() - RUN_STARTED < DEADLINE_SECONDS:
+    if api_available() and time.time() - RUN_STARTED < DEADLINE_SECONDS:
         ordered = reorder_by_embeddings(client, question, candidates)
         selected = rerank_chunks(client, question, ordered)
         selected = with_neighbours(selected, retriever.chunks)
