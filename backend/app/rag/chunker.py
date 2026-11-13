@@ -28,6 +28,7 @@ def _base(doc: dict) -> dict:
         "title": doc["title"],
         "doc_type": doc["doc_type"],
         "number": doc.get("number"),
+        "date": doc.get("date"),
         "status": doc.get("status"),
         "valid_from": doc.get("valid_from"),
         "valid_to": doc.get("valid_to"),

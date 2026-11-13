@@ -29,7 +29,7 @@ async def get_documents(
         if not doc_id or doc_id in unique_docs:
             continue
 
-        title = chunk.get("title", "Без названия")
+        title = chunk.get("doc") or chunk.get("title") or "Без названия"
 
         # Извлекаем номер из заголовка регуляркой, если нет отдельного поля
         number_match = re.search(r'№\s*[А-ЯA-Z0-9./-]+', title)
@@ -38,10 +38,12 @@ async def get_documents(
         unique_docs[doc_id] = {
             "doc_id": doc_id,
             "title": title,
-            "type": chunk.get("type", "unknown"),
-            "number": number,
-            "date": chunk.get("date", ""),
-            "status": chunk.get("status", "active")
+            # в нашем индексе поля называются doc_type / valid_from / revision
+            "type": chunk.get("doc_type") or chunk.get("type") or "unknown",
+            "number": chunk.get("number") or number,
+            "date": chunk.get("valid_from") or chunk.get("date") or "",
+            "status": chunk.get("status") or "active",
+            "revision": chunk.get("revision"),
         }
 
     docs = list(unique_docs.values())
