@@ -30,7 +30,6 @@ class ChatRequest(BaseModel):
     @field_validator("history", mode="after")
     @classmethod
     def limit_history(cls, v: list[dict]) -> list[dict]:
-        # Оставляем только последние 20 сообщений
         return v[-20:] if len(v) > 20 else v
 
 
@@ -48,20 +47,12 @@ class ChatResponse(BaseModel):
     missing_info: list[str] = Field(default_factory=list)
 
 
-# --- ЗАГЛУШКА ДЛЯ ПЛАЙПЛАЙНА (удалить после мержа ветки Даши) ---
+# --- ЗАГЛУШКА (только для тестов/локальной разработки без оркестратора) ---
 async def mock_ask(question: str, history: list[dict], retriever) -> dict:
-    """Фиктивный ответ для разработки без оркестратора."""
-    await asyncio.sleep(0.5)  # Имитация задержки
+    await asyncio.sleep(0.5)
     return {
         "answer": f"Это тестовый ответ на вопрос: «{question[:50]}...»",
-        "sources": [
-            {
-                "doc": "Договор аренды №А-08/2024",
-                "clause": "3.1",
-                "text": "Арендная плата составляет 450 000 рублей.",
-                "score": 0.92,
-            }
-        ],
+        "sources": [{"doc": "Test Doc", "clause": "1.1", "text": "Test text", "score": 0.92}],
         "refusal": False,
         "missing_info": [],
     }
@@ -71,23 +62,20 @@ async def mock_ask(question: str, history: list[dict], retriever) -> dict:
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(
-    request: ChatRequest,
-    retriever=Depends(get_retriever),
+        request: ChatRequest,
+        retriever=Depends(get_retriever),
 ):
     request_id = str(uuid.uuid4())
     start_time = time.time()
 
     try:
-        # ПОДКЛЮЧЕНИЕ РЕАЛЬНОГО ПЛАЙПЛАЙНА
-        # Раскомментировать эти строки после мержа ветки feat/ai-orchestrator
-        # from app.rag.orchestrator import ask
-        # result = await asyncio.wait_for(
-        #     ask(request.message, request.history, retriever),
-        #     timeout=settings.REQUEST_TIMEOUT
-        # )
+        # ПОДКЛЮЧЕНИЕ РЕАЛЬНОГО ПЛАЙПЛАЙНА (раскомментировано по просьбе ревьюера)
+        from app.rag.orchestrator import ask
 
-        # ВРЕМЕННАЯ ЗАГЛУШКА
-        result = await mock_ask(request.message, request.history, retriever)
+        result = await asyncio.wait_for(
+            ask(request.message, request.history, retriever),
+            timeout=settings.REQUEST_TIMEOUT
+        )
 
         latency_ms = round((time.time() - start_time) * 1000, 2)
         logger.info(
@@ -97,6 +85,12 @@ async def chat_endpoint(
             f"sources_count={len(result.get('sources', []))}"
         )
 
+        return ChatResponse(**result)
+
+    except ImportError:
+        # Fallback на моку, если ветка оркестратора ещё не смёржена
+        logger.warning(f"CHAT [{request_id}] orchestrator not found, using mock")
+        result = await mock_ask(request.message, request.history, retriever)
         return ChatResponse(**result)
 
     except asyncio.TimeoutError:
