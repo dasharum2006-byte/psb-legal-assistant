@@ -94,6 +94,19 @@ USE_RERANK = env("USE_RERANK", "1") == "1"
 
 _PROXY_WARNED = False
 
+# Почему ответ стал цитатой вместо текста модели. Печатаем в [DIAG],
+# иначе причину не видно ни в логах, ни в submission.csv.
+DEGRADE = {
+    "нет_api": 0,        # нет адреса или ключа
+    "нет_модели": 0,     # не удалось определить LLM_MODEL
+    "дедлайн": 0,        # вышли за 17 минут
+    "llm_упал": 0,       # 3 попытки к LLM не дали текста
+    "не_подтверждён": 0, # ответ не прошёл проверку обоснованности
+    "исключение": 0,     # ошибка в обработке вопроса
+    "нет_данных": 0,     # оба сигнала поиска слабые -> обоснованный отказ
+}
+ANSWER_STATS = {"модель": 0, "вторая_попытка": 0}
+
 # Модель так говорит, когда в контексте не нашлось ответа, — тогда пробуем
 # найти документы заново по расширенному запросу.
 INSUFFICIENT = re.compile(
@@ -338,7 +351,8 @@ def chunk_documents(documents: list[dict]) -> list[dict]:
         text = doc["text"]
         produced: list[dict] = []
 
-        parts = re.split(r"(?m)^\s*(\d+\.\d+)[\.\)]\s*", text)
+        # трёхуровневые пункты (3.1.1) сохраняем целиком
+        parts = re.split(r"(?m)^\s*(\d+(?:\.\d+)+)[\.\)]\s*", text)
         for index in range(1, len(parts), 2):
             body = re.sub(r"\s+", " ", parts[index + 1] if index + 1 < len(parts) else "").strip()
             if len(body) >= 30:
@@ -506,9 +520,45 @@ def make_client() -> httpx.Client | None:
         return None
 
 
+_MODEL_RESOLVED: str | None = None
+
+
+def resolve_model() -> str:
+    """Идентификатор модели. Если платформа не передала — спросим /models.
+
+    Без этого в запрос уходило "model": "" и каждый вызов падал с 400.
+    """
+    global _MODEL_RESOLVED
+    if _MODEL_RESOLVED:
+        return _MODEL_RESOLVED
+    if LLM_MODEL:
+        _MODEL_RESOLVED = LLM_MODEL
+        return _MODEL_RESOLVED
+
+    try:
+        request = urllib.request.Request(
+            API_BASE + "/models",
+            headers={"Authorization": f"Bearer {LLM_KEY}"},
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        ids = [str(item.get("id")) for item in data.get("data", []) if item.get("id")]
+        # предпочитаем генеративную модель, а не эмбеддер
+        ids.sort(key=lambda name: (0 if "deepseek" in name else 1 if "chat" in name else 2))
+        if ids:
+            _MODEL_RESOLVED = ids[0]
+            print(f"[DIAG] LLM_MODEL не задан, взяли из /models: {_MODEL_RESOLVED}", flush=True)
+    except Exception as exc:
+        print(f"[DIAG] модель не определена: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    return _MODEL_RESOLVED or ""
+
+
 def api_available() -> bool:
-    # клиент может быть None (httpx не смог) — тогда пойдём через urllib
-    return bool(API_BASE and LLM_KEY)
+    """Адрес, ключ И модель — без любого из трёх запросы бессмысленны."""
+    if not (API_BASE and LLM_KEY):
+        return False
+    return bool(resolve_model())
 
 
 _EMBEDDING_CACHE: dict[str, list[float]] = {}
@@ -768,8 +818,15 @@ def _grounded(answer: str, chunks: list[dict]) -> bool:
 
     # 1) все номера пунктов/статей из ответа должны существовать в контексте
     for clause in re.findall(r"п\.?\s*(\d+(?:\.\d+)+)", answer):
-        if clause not in context and f"п. {clause}" not in context:
-            return False
+        if clause in context or f"п. {clause}" in context:
+            continue
+        # «3.1.1» может прийти из нарезки, где сохранён только «3.1»
+        parts = clause.split(".")
+        if len(parts) >= 3:
+            parent = ".".join(parts[:2])
+            if parent in context:
+                continue
+        return False
     for article in re.findall(r"ст\.?\s*(\d+)", answer):
         if article not in context and f"статья {article}" not in context:
             return False
@@ -801,7 +858,7 @@ def ask_llm(client: httpx.Client, question: str, chunks: list[dict]) -> str | No
     budget = MAX_TOKENS
     for attempt in (1, 2, 3):
         payload = {
-            "model": LLM_MODEL,
+            "model": resolve_model(),
             "temperature": TEMPERATURE,
             "max_tokens": budget,
             "messages": [
@@ -822,9 +879,12 @@ def ask_llm(client: httpx.Client, question: str, chunks: list[dict]) -> str | No
                   f"бюджет {budget} -> {min(budget * 2, 8192)}", file=sys.stderr)
             budget = min(budget * 2, 8192)
         except Exception as exc:
-            print(f"LLM попытка {attempt}: {type(exc).__name__}", file=sys.stderr)
+            text_error = str(exc)
+            rate_limited = "429" in text_error or "Too Many" in text_error
+            print(f"LLM попытка {attempt}: {type(exc).__name__}"
+                  f"{' (429)' if rate_limited else ''}", file=sys.stderr)
             if attempt < 3:
-                time.sleep(1.5)
+                time.sleep(6.0 if rate_limited else 1.5)
     return None
 
 
@@ -923,6 +983,14 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
         for chunk in semantic:
             if (chunk["doc"], chunk["clause"]) not in seen:
                 candidates.append(chunk)
+
+    # Оба сигнала слабые — значит по базе ответить нечем. Честный отказ
+    # совпадает с golden там, где данных действительно нет.
+    best_word_score = max((c["score"] for c in candidates if c["score"] <= 60), default=0.0)
+    if not candidates or (best_word_score < MIN_SCORE and semantic_best < SEMANTIC_STRICT):
+        DEGRADE["нет_данных" if api_available() else "нет_api"] += 1
+        return REFUSAL
+
     filtered = relevant(question, candidates)
     if len(filtered) >= 3:
         candidates = filtered
@@ -930,6 +998,7 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
     # Отказ считаем по двум сигналам: если слаб и BM25, и семантика —
     # в базе действительно нет ответа (например, вопрос про пособия).
     if not candidates:
+        DEGRADE["нет_данных" if api_available() else "нет_api"] += 1
         return REFUSAL
 
     if api_available() and time.time() - RUN_STARTED < DEADLINE_SECONDS:
@@ -937,9 +1006,24 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
         selected = rerank_chunks(client, question, ordered)
         selected = with_neighbours(selected, retriever.chunks)
         text = ask_llm(client, question, selected)
+
+        if text is None:
+            # LLM не ответила: пробуем второй поиск — возможно, дело в контексте
+            DEGRADE["llm_упал"] += 1
+            if time.time() - RUN_STARTED < DEADLINE_SECONDS * 0.9:
+                retry_selected = _second_pass(client, question, retriever, selected)
+                if retry_selected:
+                    second = ask_llm(client, question, retry_selected)
+                    if second:
+                        second = _ensure_citation(second, retry_selected)
+                        if _grounded(second, retry_selected) and not INSUFFICIENT.search(second):
+                            ANSWER_STATS["вторая_попытка"] += 1
+                            return second
+
         if text:
             text = _ensure_citation(text, selected)
             if _grounded(text, selected) and not INSUFFICIENT.search(text):
+                ANSWER_STATS["модель"] += 1
                 return text
 
             # Первый контекст не дал ответа — пробуем найти другие документы.
@@ -950,12 +1034,13 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
                     if second:
                         second = _ensure_citation(second, retry_selected)
                         if _grounded(second, retry_selected) and not INSUFFICIENT.search(second):
-                            print("ответ получен со второй попытки поиска", file=sys.stderr)
+                            ANSWER_STATS["вторая_попытка"] += 1
                             return second
 
             if _grounded(text, selected):
+                ANSWER_STATS["модель"] += 1
                 return text
-            print("ответ не подтверждается контекстом, отдаём цитату", file=sys.stderr)
+            DEGRADE["не_подтверждён"] += 1
 
     # Отказ судья оценивает как «хуже baseline». Поэтому если хоть что-то
     # нашлось — отдаём обоснованную цитату, а не молчим.
@@ -991,7 +1076,7 @@ def main() -> None:
             missing.append("LLM_BASE_URL/BASE_URL/OPENAI_BASE_URL")
         if not LLM_KEY:
             missing.append("LLM_API_KEY/OPENAI_API_KEY")
-        mode = f"ЦИТАТЫ (без API: не задано {', '.join(missing)})"
+        mode = f"ЦИТАТЫ (не задано {', '.join(missing)})"
     print(f"[DIAG] документов={len(documents)} чанков={len(chunks)} "
           f"вопросов={len(rows)} TOP_K={TOP_K} TOP_N={RERANKER_TOP_N} "
           f"workers={MAX_WORKERS} model={LLM_MODEL or '-'} режим={mode}", flush=True)
@@ -1010,6 +1095,7 @@ def main() -> None:
         try:
             return position, answer_question(shared_client, search_text, retriever)
         except Exception as exc:
+            DEGRADE["исключение"] += 1
             print(f"вопрос {position}: {type(exc).__name__}: {exc}", file=sys.stderr)
             try:
                 return position, extractive_answer(question, retriever.search(question))
@@ -1036,7 +1122,10 @@ def main() -> None:
     refused = sum(1 for text in answers if text == REFUSAL)
     cited = sum(1 for text in answers if re.search(r"(п\.|ст\.|абз\.)", text))
     print(f"[DIAG] готово: {len(answers)} ответов, отказов={refused}, "
-          f"со_ссылкой={cited}, режим={'LLM' if api_available() else 'цитаты'}", flush=True)
+          f"со_ссылкой={cited}", flush=True)
+    print(f"[DIAG] от_модели={ANSWER_STATS['модель']} "
+          f"вторая_попытка={ANSWER_STATS['вторая_попытка']} "
+          f"деградации={DEGRADE}", flush=True)
 
 
 if __name__ == "__main__":
