@@ -1017,7 +1017,43 @@ def ask_llm(
     return None
 
 
-def _pick_sentences(chunk: dict, wanted: set[str], limit: int = 320) -> str:
+VALUE_MARKERS = (
+    "сколько", "какая", "какой", "какое", "какие", "размер", "сумма", "сумму",
+    "стоимость", "цена", "процент", "ставка", "тариф", "штраф", "пеня",
+    "неустойка", "плата", "срок", "когда",
+)
+# вопросы про время: значение важнее, но порядок не переставляем —
+# на «когда вносится плата» ответ должен начинаться со срока, а не с суммы
+TIMING_MARKERS = ("когда", "в какой срок", "как часто", "с какого", "до какого", "какого числа")
+
+
+def has_amount(text: str) -> bool:
+    """В тексте есть величина: сумма, процент или срок в днях.
+
+    «не позднее 5-го числа» — это дата, а не значение: цифра есть, смысла нет.
+    """
+    if re.search(r"\d[\d\s]{2,}", text):          # 450 000
+        return True
+    if re.search(r"\d+[.,]\d+\s*%", text):        # 0,05%
+        return True
+    if re.search(r"\d+\s*(?:%|процент|руб|дн)", text):
+        return True
+    return False
+
+
+def wants_value(question: str) -> bool:
+    """Спрашивают ли про конкретное значение (сумму, срок, процент)."""
+    low = question.lower()
+    return any(marker in low for marker in VALUE_MARKERS)
+
+
+def asks_timing(question: str) -> bool:
+    low = question.lower()
+    return any(marker in low for marker in TIMING_MARKERS)
+
+
+def _pick_sentences(chunk: dict, wanted: set[str], limit: int = 320,
+                    want_value: bool = False) -> str:
     raw_sentences = [s.strip() for s in re.split(r"(?<=[.;])\s+", chunk["text"]) if s.strip()]
     # «Химки, ул.» — это не предложение, а обрывок из-за сокращений «г.», «ул.»
     sentences = [s for s in raw_sentences if len(s) >= 40]
@@ -1035,7 +1071,12 @@ def _pick_sentences(chunk: dict, wanted: set[str], limit: int = 320) -> str:
         if any(word in sentence.lower() for word in blacklist):
             continue
         overlap = len(wanted & significant_tokens(sentence))
-        scored.append((overlap, -len(sentence), sentence))
+        # Вопрос про сумму/срок: предложение с числом информативнее любого
+        # другого совпадения по словам. Без этого на «какая арендная плата?»
+        # выбирался пункт про дату внесения, а сама сумма терялась.
+        has_value = 1 if has_amount(sentence) else 0
+        value_bonus = 3 * has_value if want_value else has_value
+        scored.append((overlap + value_bonus, -len(sentence), sentence))
     scored.sort(reverse=True)
 
     picked, total = [], 0
@@ -1056,12 +1097,21 @@ def _pick_sentences(chunk: dict, wanted: set[str], limit: int = 320) -> str:
 
 def extractive_answer(question: str, chunks: list[dict]) -> str:
     wanted = significant_tokens(question)
+    ask_value = wants_value(question)
+    candidates = chunks[:2]
+    if ask_value and not asks_timing(question):
+        # вопрос про значение — сначала пункт, где это значение записано
+        candidates = sorted(
+            candidates,
+            key=lambda c: (1 if has_amount(c["text"]) else 0, c.get("score", 0)),
+            reverse=True,
+        )
     parts = []
-    for chunk in chunks[:2]:
+    for chunk in candidates:
         if len(chunk["text"]) <= 320:
             text = chunk["text"].strip()      # короткий пункт — весь является ответом
         else:
-            text = _pick_sentences(chunk, wanted)
+            text = _pick_sentences(chunk, wanted, want_value=ask_value)
         if text:
             parts.append(f"{text} {_citation(chunk)}")
     return " ".join(parts) if parts else REFUSAL
