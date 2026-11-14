@@ -69,7 +69,7 @@ RERANKER_MODEL = env("RERANKER_MODEL", "cohere/rerank-5-fast")
 # Такие значения слишком малы: нужный пункт не доходит до модели.
 # Берём не меньше своих минимумов.
 TOP_K = max(env_int("TOP_K", 14, 1, 20), 12)
-RERANKER_TOP_N = max(env_int("RERANKER_TOP_N", 5, 1, 8), 5)
+RERANKER_TOP_N = max(env_int("RERANKER_TOP_N", 6, 1, 8), 6)
 MAX_TOKENS = max(env_int("MAX_TOKENS", 1500, 128, 8192), 1200)
 # платформа может передать 1 поток — на 100 вопросах это упирается в лимит
 # 20 минут, поэтому держим не меньше 4
@@ -733,7 +733,7 @@ SYSTEM_PROMPT = (
     "Ты юридический ассистент компании. Отвечай ТОЛЬКО по фрагментам документов из блока КОНТЕКСТ.\n"
     "\n"
     "ФОРМАТ ОТВЕТА: 2-4 предложения, до 500 символов. "
-    "Начни с прямого ответа: «Да», «Нет» или сам факт.\n"
+    "Сначала прямой ответ: «Да», «Нет» или сам факт.\n"
     "\n"
     "ССЫЛКИ — обязательны для каждого факта:\n"
     "  - договоры и внутренние документы: (п. 3.1) в конце предложения;\n"
@@ -841,14 +841,13 @@ def _grounded(answer: str, chunks: list[dict]) -> bool:
 
 
 def _citation(chunk: dict) -> str:
-    title = chunk["doc"]
-    number = chunk.get("number") or ""
-    suffix = "" if not number or number.replace("№", "").strip() in title else f" № {number}"
+    """Короткая ссылка, как в эталонных ответах: (п. 3.1) или (ст. 70)."""
     clause = str(chunk["clause"]).strip()
-
-    # для статей и абзацев приставка «п.» не нужна
-    prefix = "" if clause.startswith(("ст.", "абз.")) else "п. "
-    return f"({title}{suffix}, {prefix}{clause})"
+    if clause.startswith("ст."):
+        return f"({clause})"
+    if clause.startswith("абз."):
+        return f"({clause})"
+    return f"(п. {clause})"
 
 
 def ask_llm(client: httpx.Client, question: str, chunks: list[dict]) -> str | None:
@@ -1004,6 +1003,15 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
     if api_available() and time.time() - RUN_STARTED < DEADLINE_SECONDS:
         ordered = reorder_by_embeddings(client, question, candidates)
         selected = rerank_chunks(client, question, ordered)
+
+        # реранкер может «потерять» нужный пункт: добавляем лучшие по словам,
+        # которых в его списке нет
+        seen = {(chunk["doc"], chunk["clause"]) for chunk in selected}
+        for chunk in candidates[:4]:
+            if (chunk["doc"], chunk["clause"]) not in seen:
+                selected.append(chunk)
+                seen.add((chunk["doc"], chunk["clause"]))
+        selected = selected[: RERANKER_TOP_N + 2]
         selected = with_neighbours(selected, retriever.chunks)
         text = ask_llm(client, question, selected)
 
