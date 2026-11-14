@@ -1,6 +1,9 @@
 import sys
 import os
 import json
+import hashlib
+from datetime import datetime, timezone
+from pathlib import Path
 
 # Добавляем путь к корню проекта, чтобы работали импорты из backend
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -31,7 +34,25 @@ def main(kb_path):
         for chunk in chunks:
             f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
             
+    # Отпечаток кода нарезки: по нему сервер поймёт, что индекс устарел
+    fingerprint = ""
+    for name in ("backend/app/rag/chunker.py", "backend/app/rag/parser.py"):
+        path = Path(name)
+        if path.exists():
+            fingerprint += hashlib.sha256(path.read_bytes()).hexdigest()
+
+    meta = {
+        "chunks": len(chunks),
+        "documents": len(docs),
+        "code_fingerprint": hashlib.sha256(fingerprint.encode()).hexdigest()[:16],
+        "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source": str(kb_path),
+    }
+    with open("data/index/meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
     print(f"✅ Готово! Индекс сохранен в {chunks_path}")
+    print(f"   meta: {meta['chunks']} чанков, отпечаток кода {meta['code_fingerprint']}")
 
 if __name__ == "__main__":
     # Путь к архиву. Если запускаешь из корня проекта, путь такой:

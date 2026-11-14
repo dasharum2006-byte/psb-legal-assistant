@@ -1,5 +1,7 @@
 # backend/app/main.py
 from contextlib import asynccontextmanager
+import hashlib
+import json
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,6 +45,29 @@ async def lifespan(app: FastAPI):
         if not getattr(rag_retriever, "_chunks_store", None):
             raise RuntimeError("индекс пуст: сначала запустите scripts/build_index.py")
 
+        # Проверяем, что индекс собран тем же кодом нарезки
+        app.state.index_stale = None
+        meta_path = index_dir / "meta.json"
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            # считаем от корня проекта, как это делает scripts/build_index.py
+            repo_root = Path(__file__).resolve().parents[2]
+            fingerprint = ""
+            for name in ("chunker.py", "parser.py"):
+                code = repo_root / "backend/app/rag" / name
+                if code.exists():
+                    fingerprint += hashlib.sha256(code.read_bytes()).hexdigest()
+            actual = hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
+            if meta.get("code_fingerprint") != actual:
+                app.state.index_stale = (
+                    f"индекс собран {meta.get('built_at')} другим кодом нарезки — "
+                    f"пересоберите: python scripts/build_index.py"
+                )
+                logger.warning("INDEX_STALE: %s", app.state.index_stale)
+        else:
+            app.state.index_stale = "нет meta.json — пересоберите индекс: python scripts/build_index.py"
+            logger.warning("INDEX_STALE: %s", app.state.index_stale)
+
         # Кладем в state сам модуль (у него есть .search())
         app.state.retriever = rag_retriever
         app.state.index_error = None
@@ -82,6 +107,7 @@ def health():
             "status": "ok" if orchestrator == "ok" else "degraded",
             "index": "loaded",
             "orchestrator": orchestrator,
+            "index_stale": getattr(app.state, "index_stale", None),
             "version": "0.1.0",
         }
 
