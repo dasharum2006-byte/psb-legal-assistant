@@ -356,7 +356,7 @@ def ask(
     "status": ["active"], "as_of": "2024-08-31"}.
     """
     from app.llm.client import LLMClient
-    from app.llm.prompt import build_rag_prompt
+    from app.llm.prompt import SYSTEM_PROMPT, build_rag_prompt
     from app.llm.verifier import Verifier
 
     analysis = analyze_query(contextual_query(question, history))
@@ -385,7 +385,16 @@ def ask(
     client = client or LLMClient()
     try:
         prompt = build_rag_prompt(question, picked, history)
-        answer = client.generate(prompt)
+        # SYSTEM_PROMPT уходит отдельным system-сообщением: в нём формат
+        # ссылок, примеры и защита от инъекций. Раньше он не передавался
+        # вовсе, и модель отвечала без всех этих правил.
+        try:
+            answer = client.generate(prompt, system=SYSTEM_PROMPT)
+        except TypeError as exc:
+            # клиент без параметра system (старая сигнатура или заглушка в тестах):
+            # правила теряются, но ответ пользователю нужен — логируем и зовём как раньше
+            logger.warning("CLIENT_WITHOUT_SYSTEM: %s", exc)
+            answer = client.generate(prompt)
     except TypeError as exc:
         # несовпадение сигнатур (например, промпт перестал принимать history)
         # — это ошибка кода, её надо видеть, а не маскировать отказом
