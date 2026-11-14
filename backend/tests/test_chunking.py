@@ -82,3 +82,26 @@ def test_no_chunk_is_oversized() -> None:
     chunks = sol.chunk_documents([_doc(text, doc_type="law", title="Статья 999")])
     assert chunks, "документ не должен теряться"
     assert max(len(chunk["text"]) for chunk in chunks) <= 2200, "чанк раздулся выше лимита"
+
+
+def test_section_heading_does_not_leak_into_previous_clause() -> None:
+    """Заголовок следующего раздела не должен попадать в текст пункта."""
+    text = (
+        "ДОГОВОР № 4\n"
+        "5. Ответственность сторон\n"
+        "5.1. За просрочку платежа начисляется пеня 0,1 процента за каждый день.\n"
+        "6. Изменение и расторжение договора\n"
+        "6.1. Изменения оформляются дополнительным соглашением сторон.\n"
+    )
+    chunks = sol.chunk_documents([_doc(text)])
+    chunk = next(c for c in chunks if c["clause"] == "5.1")
+    assert "Изменение и расторжение" not in chunk["text"], "заголовок 6 протёк в пункт 5.1"
+    assert chunk["section"].startswith("5.")
+
+
+def test_section_present_in_prompt() -> None:
+    """Модель должна видеть, к какому разделу относится пункт."""
+    chunks = [{"doc": "ДОГОВОР № 4", "clause": "5.1", "section": "5. Ответственность сторон",
+               "text": "За просрочку начисляется пеня.", "repealed": False}]
+    prompt = sol.build_prompt("какая пеня?", chunks)
+    assert "Ответственность сторон" in prompt

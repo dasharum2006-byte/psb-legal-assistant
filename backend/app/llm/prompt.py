@@ -46,6 +46,7 @@ def _source_header(chunk: dict) -> str:
     """Шапка источника: документ, пункт и признак устаревшей редакции."""
     doc = chunk.get("doc") or chunk.get("title") or "Неизвестный документ"
     clause = chunk.get("clause") or "без пункта"
+    section = chunk.get("section")
 
     marks = []
     if chunk.get("status") == "repealed" or chunk.get("valid_to"):
@@ -54,7 +55,8 @@ def _source_header(chunk: dict) -> str:
         marks.append(f"ред. {chunk['revision']}")
 
     suffix = f" [{', '.join(marks)}]" if marks else ""
-    return f"Источник: {doc}, пункт/статья: {clause}{suffix}"
+    where = f"раздел «{section}», пункт: {clause}" if section else f"пункт/статья: {clause}"
+    return f"Источник: {doc}, {where}{suffix}"
 
 
 def build_rag_prompt(question: str, chunks: list[dict]) -> str:

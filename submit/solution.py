@@ -424,7 +424,7 @@ def chunk_documents(documents: list[dict]) -> list[dict]:
 
         for position, match in enumerate(matches):
             end = matches[position + 1].start() if position + 1 < len(matches) else len(text)
-            body = re.sub(r"\s+", " ", text[match.end():end]).strip()
+            body = re.sub(r"\s+", " ", _strip_headings(text[match.end():end])).strip()
             # у одноуровневых пунктов тело заголовка короткое — такие не берём
             if len(body) < (60 if single_level else 30):
                 continue
@@ -453,7 +453,24 @@ def chunk_documents(documents: list[dict]) -> list[dict]:
     return chunks
 
 
-def _section_map(text: str) -> list[tuple[int, str]]:
+HEADING_RE = re.compile(r"^\s*\d+(?:\.\d+)*\.?\s+[А-ЯЁ][^\n]{2,90}$")
+
+
+def _strip_headings(body: str) -> str:
+    """Убрать из тела пункта строки-заголовки следующих разделов.
+
+    Без этого текст пункта 5.1 заканчивается заголовком «6. Изменение и
+    расторжение договора»: он попадает в поиск, в эмбеддинг и в промпт.
+    """
+    lines = body.splitlines()
+    while lines and HEADING_RE.match(lines[0]):
+        lines.pop(0)
+    while lines and HEADING_RE.match(lines[-1]):
+        lines.pop()
+    return "\n".join(lines)
+
+
+def _section_map(text: str) -> list[tuple[str, str]]:
     """Позиции и названия разделов вида «3. Арендная плата»."""
     return [
         (match.start(), f"{match.group(1)}. {match.group(2).strip()}")
@@ -856,9 +873,9 @@ def build_prompt(question: str, chunks: list[dict]) -> str:
     parts = []
     for index, chunk in enumerate(chunks, 1):
         mark = " [УТРАТИЛА СИЛУ]" if chunk.get("repealed") else ""
-        parts.append(
-            f"[{index}] «{chunk['doc']}», п. {chunk['clause']}{mark}\n{chunk['text']}"
-        )
+        section = chunk.get("section")
+        where = f"раздел «{section}», п. {chunk['clause']}" if section else f"п. {chunk['clause']}"
+        parts.append(f"[{index}] «{chunk['doc']}», {where}{mark}\n{chunk['text']}")
     return "КОНТЕКСТ:\n" + "\n\n".join(parts) + f"\n\nВОПРОС: {question}\n\nОТВЕТ:"
 
 

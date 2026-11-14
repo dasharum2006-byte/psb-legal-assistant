@@ -62,6 +62,23 @@ def _make_chunk(
     return chunk
 
 
+HEADING_RE = re.compile(r"^\s*\d+(?:\.\d+)*\.?\s+[А-ЯЁ][^\n]{2,90}$")
+
+
+def _strip_headings(body: str) -> str:
+    """Убрать строки-заголовки разделов из тела пункта.
+
+    Без этого пункт 5.1 заканчивается заголовком «6. Изменение и
+    расторжение договора», и он попадает в поиск и в промпт.
+    """
+    lines = body.splitlines()
+    while lines and HEADING_RE.match(lines[0]):
+        lines.pop(0)
+    while lines and HEADING_RE.match(lines[-1]):
+        lines.pop()
+    return "\n".join(lines)
+
+
 def _by_clauses(doc: dict) -> list[dict]:
     """Договоры и регламенты: один пункт = один чанк («3.1», «2.4»)."""
     chunks: list[dict] = []
@@ -80,7 +97,7 @@ def _by_clauses(doc: dict) -> list[dict]:
 
     for position, match in enumerate(matches):
         end = matches[position + 1].start() if position + 1 < len(matches) else len(text)
-        body = text[match.end():end]
+        body = _strip_headings(text[match.end():end])
         if len(body.strip()) < (120 if single_level else 30):
             continue
 
@@ -104,6 +121,7 @@ def _by_paragraphs(doc: dict, prefix: str = "абз.") -> list[dict]:
 
     number = 0
     for block in blocks:
+        block = _strip_headings(block)
         # шапка garant.ru в законах не нужна как отдельный чанк
         if block.strip().lower().startswith(("источник:", "url:", "дата выгрузки:")):
             continue
@@ -136,7 +154,7 @@ def _by_articles(doc: dict) -> list[dict]:
                 continue
             # абзац может быть длиннее лимита (в законах часто нет пустых
             # строк) — режем дополнительно по предложениям
-            for piece in _split_by_sentences(block, MAX_LAW_CHUNK):
+            for piece in _split_by_sentences(_strip_headings(block), MAX_LAW_CHUNK):
                 part_number += 1
                 chunk = _make_chunk(doc, article, piece, part=str(part_number))
                 if chunk:
