@@ -6,8 +6,11 @@ import re
 
 _SEPARATORS = str.maketrans(dict.fromkeys("«»\"'`№", " "))
 _AMOUNT = re.compile(
-    r"(?<![\w.,/])(?P<number>\d{1,3}(?: \d{3})+|\d+)"
-    r"(?P<fraction>[.,]\d+)?"
+    # тысячи: «450 000» или «1.500.000»; дробь — только 1-2 знака
+    # (десятые доли миллионов и копейки), иначе «1.500.000» распадалось
+    # на число 1 и дробь .500 и сумма терялась
+    r"(?<![\w.,/])(?P<number>\d{1,3}(?:[ .]\d{3})+|\d+)"
+    r"(?P<fraction>[.,]\d{1,2})?(?!\d)"
     r"(?:\s*(?P<unit>млн|миллион(?:а|ов)?|тыс(?:яч(?:а|и)?)?|"
     r"руб(?:ль|ля|лей)?|р\.|₽)(?!\w))?"
     r"(?P<percent>\.?\s*(?:%|процент(?:а|ов)?\b))?"
@@ -46,9 +49,11 @@ def parse_amounts(text: str) -> list[int]:
             multiplier = 1_000
 
         fraction = (match["fraction"] or "")[1:]
+        if len(fraction) > 2:
+            fraction = ""
         if fraction and multiplier == 1 and not unit:
             continue
-        value = int(number.replace(" ", "")) * multiplier
+        value = int(re.sub(r"[ .]", "", number)) * multiplier
         if fraction:
             value += int(fraction) * multiplier // 10 ** len(fraction)
         amounts.append(value)

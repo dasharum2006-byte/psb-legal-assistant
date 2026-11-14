@@ -50,3 +50,30 @@ def test_normalize_clause() -> None:
     assert normalize_clause("п. 1") == "1"
     assert normalize_clause("ст. 13.11") == "13.11"
     assert normalize_clause("никаких ссылок тут нет") is None
+
+
+def test_amounts_with_dot_as_thousands_separator() -> None:
+    """«1.500.000 руб.» — это полтора миллиона, а не 1 рубль и не пусто."""
+    assert parse_amounts("1.500.000 руб.") == [1_500_000]
+    assert parse_amounts("1.234.567 рублей") == [1_234_567]
+
+
+def test_amounts_with_spaces() -> None:
+    assert parse_amounts("450 000 рублей") == [450_000]
+    assert parse_amounts("12 000 000 рублей") == [12_000_000]
+
+
+def test_fractional_millions_and_thousands() -> None:
+    assert parse_amounts("1,5 млн") == [1_500_000]
+    assert parse_amounts("1,5 тыс.") == [1_500]
+
+
+def test_kopeks_are_dropped_not_multiplied() -> None:
+    assert parse_amounts("100,05 руб.") == [100]
+
+
+def test_percents_years_and_articles_are_not_amounts() -> None:
+    assert parse_amounts("не более 7%") == []
+    assert parse_amounts("0,1% от суммы") == []
+    assert parse_amounts("в августе 2024 года") == []
+    assert parse_amounts("ст. 13.11 КоАП") == []
