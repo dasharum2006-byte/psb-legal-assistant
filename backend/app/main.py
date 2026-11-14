@@ -15,6 +15,19 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Загружаем индекс один раз при старте сервера"""
+    # Проверяем импорт оркестратора сразу: если он сломан (нет зависимости,
+    # кривой путь), лучше видеть это на старте и в /api/health, чем ловить
+    # 503 на каждом вопросе.
+    try:
+        from app.api.chat import load_ask
+
+        load_ask()
+        app.state.orchestrator_error = None
+        logger.info("Orchestrator imported successfully")
+    except Exception as exc:                      # noqa: BLE001
+        app.state.orchestrator_error = f"{type(exc).__name__}: {exc}"
+        logger.exception("ORCHESTRATOR IMPORT FAILED")
+
     try:
         # Правильный импорт по инструкции ревьюера
         from app.rag import retriever as rag_retriever
@@ -62,12 +75,20 @@ def health():
     retriever = getattr(app.state, "retriever", None)
     error_msg = getattr(app.state, "index_error", "Unknown state")
 
+    orchestrator = getattr(app.state, "orchestrator_error", None) or "ok"
+
     if retriever is not None:
-        return {"status": "ok", "index": "loaded", "version": "0.1.0"}
+        return {
+            "status": "ok" if orchestrator == "ok" else "degraded",
+            "index": "loaded",
+            "orchestrator": orchestrator,
+            "version": "0.1.0",
+        }
 
     return {
         "status": "degraded",
         "index": None,
+        "orchestrator": orchestrator,
         "error": str(error_msg),
         "hint": "Run 'python scripts/build_index.py' and restart server"
     }

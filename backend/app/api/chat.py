@@ -47,18 +47,19 @@ class ChatResponse(BaseModel):
     missing_info: list[str] = Field(default_factory=list)
 
 
-# --- ЗАГЛУШКА (только для тестов/локальной разработки без оркестратора) ---
-async def mock_ask(question: str, history: list[dict], retriever) -> dict:
-    await asyncio.sleep(0.5)
-    return {
-        "answer": f"Это тестовый ответ на вопрос: «{question[:50]}...»",
-        "sources": [{"doc": "Test Doc", "clause": "1.1", "text": "Test text", "score": 0.92}],
-        "refusal": False,
-        "missing_info": [],
-    }
-
-
 # --- ЭНДПОИНТ ---
+
+def load_ask():
+    """Импорт оркестратора отдельной функцией.
+
+    Раньше здесь стоял `except ImportError` с откатом на заглушку: при любой
+    проблеме с импортом (нет библиотеки в контейнере, кривой путь) API молча
+    отдавал фальшивый ответ. Теперь ошибка видна и возвращается 503.
+    """
+    from app.rag.orchestrator import ask
+
+    return ask
+
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(
@@ -69,8 +70,7 @@ async def chat_endpoint(
     start_time = time.time()
 
     try:
-        # ПОДКЛЮЧЕНИЕ РЕАЛЬНОГО ПЛАЙПЛАЙНА (раскомментировано по просьбе ревьюера)
-        from app.rag.orchestrator import ask
+        ask = load_ask()
 
         result = await asyncio.wait_for(
             asyncio.to_thread(
@@ -95,10 +95,16 @@ async def chat_endpoint(
         return ChatResponse(**result)
 
     except ImportError:
-        # Fallback на моку, если ветка оркестратора ещё не смёржена
-        logger.warning(f"CHAT [{request_id}] orchestrator not found, using mock")
-        result = await mock_ask(request.message, request.history, retriever)
-        return ChatResponse(**result)
+        # Никаких заглушек: если оркестратор не импортируется — это авария,
+        # её надо видеть, а не маскировать фальшивым ответом.
+        logger.exception(f"CHAT [{request_id}] ORCHESTRATOR_IMPORT_FAILED")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Оркестратор недоступен: ошибка импорта",
+                "hint": "проверьте зависимости и импорты в app.rag.orchestrator",
+            },
+        )
 
     except asyncio.TimeoutError:
         logger.error(f"CHAT [{request_id}] TIMEOUT after {settings.REQUEST_TIMEOUT}s")
