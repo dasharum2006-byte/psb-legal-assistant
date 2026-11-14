@@ -156,23 +156,24 @@ def find_doc_ids(question: str) -> list[str]:
     # опознаем документ в вопросе по номеру или контрагенту
     text = question.lower().replace("ё","е")
     result = []
-    if "а-08" in text and "А-08/2024" not in result:
-        result.append("А-08/2024")
-    if "п-17" in text and "П-17/2024" not in result:
-        result.append("П-17/2024")
-    if "пт-05" in text and "ПТ-05/2023" not in result:
-        result.append("ПТ-05/2023")
-    if "юо-7" in text and "ЮО-7" not in result:
-        result.append("ЮО-7")
-    if "к-12" in text and "К-12" not in result:
-        result.append("К-12")
-    if "альфа-трейдинг" in text:
+    # границы слова: «к-12» не должен срабатывать внутри «К-123»
+    number_map = (
+        ("а-08", "А-08/2024"),
+        ("п-17", "П-17/2024"),
+        ("пт-05", "ПТ-05/2023"),
+        ("юо-7", "ЮО-7"),
+        ("к-12", "К-12"),
+    )
+    for pattern, doc_id in number_map:
+        if re.search(rf"(?<![а-яa-z0-9]){re.escape(pattern)}(?!\d)", text) and doc_id not in result:
+            result.append(doc_id)
+    if re.search(r"(?<![а-я])альфа-трейдинг", text):
         if "ПТ-05/2023" not in result:
             result.append("ПТ-05/2023")
-    elif "альфа-трейд" in text:
+    elif re.search(r"(?<![а-я])альфа-трейд(?![а-я])", text):
         if "П-17/2024" not in result:
             result.append("П-17/2024")
-    if "северн" in text and "А-08/2024" not in result:
+    if re.search(r"северн", text) and "А-08/2024" not in result:
         result.append("А-08/2024")
     return result
 
@@ -210,10 +211,7 @@ def find_date(question: str) -> str | None:
                 count_days = calendar.monthrange(year,number)[1]
                 return f"{year:04d}-{number:02d}-{count_days:02d}" 
 
-        for name, number in MONTHS.items():                                                                    
-               if name in text:                                                                                   
-                   count_days = calendar.monthrange(year, number)[1]                                              
-                   return f"{year:04d}-{number:02d}-{count_days:02d}"                                                                                                                                       
+                                                                                                                                       
         if re.search(r"\b(год|году|г\.)", text):                                                               
             return f"{year:04d}-12-31"  
     return  None      

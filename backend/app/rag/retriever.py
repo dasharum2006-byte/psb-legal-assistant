@@ -15,12 +15,6 @@ _bm25_index = None
 _chunks_store = []
 
 
-SYNONYMS = {
-    "северный склад": "документы_компании__договор_аренды_а-08-2024_северный_склад",
-    "альфа-трейд": "документы_компании__договор_поставки_п-17-2024_альфа-трейд",
-    "альфа-трейдинг": "документы_компании__договор_поставки_пт-05-2023_альфа-трейдинг"
-}
-
 def tokenize(text: str) -> list[str]:
     """Токены для BM25 со стеммингом.
 
@@ -46,32 +40,14 @@ def search(query: str, k: int = 8) -> list[dict]:
     if globals().get("_bm25_index") is None or not _chunks_store:
         return []
         
-    # 1. Убираем слово "договор" из запроса, чтобы оно не сбивало с толку
-    query_clean = query.lower().replace("договор", "").replace("договора", "")
-    
+    # Единственная предобработка: служебное слово «договор» встречается почти
+    # в каждом фрагменте и только размывает веса. Никаких бонусов под
+    # конкретные документы и суммы — после стемминга BM25 справляется сам,
+    # а хардкод под 18 демо-вопросов не работал бы на приватном наборе.
+    query_clean = re.sub(r"\bдоговор[а-я]*\b", " ", query.lower())
+
     tokenized_query = tokenize(query_clean)
     scores = _bm25_index.get_scores(tokenized_query)
-    
-    # 2. Добавляем бонусы
-    query_lower = query.lower()
-    for keyword, target_doc_id in SYNONYMS.items():
-        if keyword in query_lower:
-            for idx, chunk in enumerate(_chunks_store):
-                if chunk.get('doc_id') == target_doc_id:
-                    scores[idx] += 50.0  # Огромный бонус за правильный документ
-                    
-    # 3. Дополнительный бонус за слова в тексте пункта
-    if "арендная плата" in query_lower:
-        for idx, chunk in enumerate(_chunks_store):
-            if "арендная плата" in chunk.get('text', '').lower():
-                scores[idx] += 30.0 # Еще бонус, если в тексте есть "арендная плата"
-
-    # 4. Бонус за пункт, где есть конкретная сумма (например, 450 000)
-    if "450" in query_lower or "арендная плата" in query_lower:
-        for idx, chunk in enumerate(_chunks_store):
-            # Если в тексте есть "450 000" или "450000"
-            if "450 000" in chunk.get('text', '') or "450000" in chunk.get('text', ''):
-                scores[idx] += 20.0
 
     sorted_indices = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
     results = []

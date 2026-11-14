@@ -43,11 +43,16 @@ def test_search_works_after_index_loaded() -> None:
         "R.load_index_from_disk('../data/index')\n"
         "res = R.search('какая арендная плата по договору с северным складом?')\n"
         "print(len(res), res[0]['clause'] if res else '-')\n"
+        "print(' '.join(c['clause'] for c in res))\n"
     )
     lines = [line for line in out.strip().splitlines() if line and not line.startswith("✅")]
-    count, clause = lines[-1].split()
+    count, clause = lines[-2].split()
     assert int(count) > 0, out
-    assert clause == "3.1", out
+    # после отказа от хардкод-бонусов порядок внутри раздела «Арендная плата»
+    # может быть 3.1 или 3.2 — оба пункта должны попасть в выдачу
+    assert clause in {"3.1", "3.2"}, out
+    all_clauses = set(lines[-1].split())
+    assert {"3.1", "3.2"} <= all_clauses, f"в выдаче нет обоих пунктов про плату: {all_clauses}"
 
 
 def test_retriever_stems_russian_word_forms() -> None:
