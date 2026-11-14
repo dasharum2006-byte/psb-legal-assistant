@@ -11,7 +11,7 @@ import re
 import os
 import json
 
-bm_25_index = None
+_bm25_index = None
 _chunks_store = []
 
 
@@ -35,7 +35,9 @@ def build_index(chunks: list[dict]):
     print(f"Индекс ВМ25 построен на {len(chunks)} чанках")
 
 def search(query: str, k: int = 8) -> list[dict]:
-    if _bm25_index is None:
+    # До загрузки индекса глобальной переменной может не быть вовсе —
+    # без этой проверки search() бросал NameError вместо пустого списка.
+    if globals().get("_bm25_index") is None or not _chunks_store:
         return []
         
     # 1. Убираем слово "договор" из запроса, чтобы оно не сбивало с толку
