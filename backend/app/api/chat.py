@@ -34,10 +34,66 @@ class ChatRequest(BaseModel):
 
 
 class Source(BaseModel):
-    doc: str
-    clause: str
-    text: str
-    score: float
+    doc: str = ""
+    clause: str = ""
+    text: str = ""
+    score: float = 0.0
+
+    @field_validator("doc", "clause", "text", mode="before")
+    @classmethod
+    def coerce_text(cls, value):
+        """None и числа приводим к строке: иначе валидация роняет весь ответ."""
+        if value is None:
+            return ""
+        return value if isinstance(value, str) else str(value)
+
+    @field_validator("score", mode="before")
+    @classmethod
+    def coerce_score(cls, value):
+        """numpy.float32, Decimal, строка, None — всё сводим к float."""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+
+def _as_text(value) -> str:
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else str(value)
+
+
+def _as_float(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def sanitize_result(result: dict | None) -> dict:
+    """Привести словарь оркестратора к видам, которые ждёт схема ответа.
+
+    Оркестратор может вернуть None в clause (документы без нумерации),
+    numpy.float32 в score или пустой answer — всё это раньше роняло ответ
+    в 500 через ошибку валидации.
+    """
+    result = result or {}
+    sources = []
+    for item in result.get("sources") or []:
+        item = item or {}
+        sources.append({
+            "doc": _as_text(item.get("doc")),
+            "clause": _as_text(item.get("clause")),
+            "text": _as_text(item.get("text")),
+            "score": _as_float(item.get("score")),
+        })
+
+    return {
+        "answer": _as_text(result.get("answer")) or "Не удалось сформировать ответ.",
+        "sources": sources,
+        "refusal": bool(result.get("refusal")),
+        "missing_info": [_as_text(item) for item in (result.get("missing_info") or [])],
+    }
 
 
 class ChatResponse(BaseModel):
@@ -92,7 +148,7 @@ async def chat_endpoint(
             f"sources_count={len(result.get('sources', []))}"
         )
 
-        return ChatResponse(**result)
+        return ChatResponse(**sanitize_result(result))
 
     except ImportError:
         # Никаких заглушек: если оркестратор не импортируется — это авария,
