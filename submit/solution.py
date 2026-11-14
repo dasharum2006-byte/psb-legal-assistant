@@ -352,7 +352,16 @@ def _split_long(body: str, limit: int = 1500) -> list[str]:
             current = f"{current} {block}".strip()
     if current:
         pieces.append(current)
-    return [piece for piece in pieces if len(piece) >= 30]
+
+    # абзац может быть длиннее лимита (в законах часто нет пустых строк) —
+    # тогда режем по границам предложений, чтобы чанк не раздувался
+    result: list[str] = []
+    for piece in pieces:
+        if len(piece) > limit:
+            result.extend(_split_sentences(piece, limit=limit))
+        elif len(piece) >= 30:
+            result.append(piece)
+    return result
 
 
 def chunk_documents(documents: list[dict]) -> list[dict]:

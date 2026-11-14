@@ -72,3 +72,13 @@ def test_law_is_split_by_articles_not_by_numbered_parts() -> None:
     chunks = sol.chunk_documents([_doc(text, doc_type="law", title="Статья 70")])
     assert all(chunk["clause"].startswith("ст.") for chunk in chunks)
     assert any("ст. 70" in chunk["clause"] for chunk in chunks)
+
+
+def test_no_chunk_is_oversized() -> None:
+    """Длинная статья без пустых строк не должна улетать одним куском."""
+    long_sentence = ("Налогоплательщик вправе уменьшить сумму налога на сумму расходов, "
+                     "связанных с производством и реализацией товаров, работ и услуг. ") * 60
+    text = f"Источник: Статья 999. Тестовая статья\n\n{long_sentence}"
+    chunks = sol.chunk_documents([_doc(text, doc_type="law", title="Статья 999")])
+    assert chunks, "документ не должен теряться"
+    assert max(len(chunk["text"]) for chunk in chunks) <= 2200, "чанк раздулся выше лимита"

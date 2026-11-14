@@ -134,11 +134,33 @@ def _by_articles(doc: dict) -> list[dict]:
         for block in re.split(r"\n\s*\n", body):
             if len(block.strip()) < 30:
                 continue
-            part_number += 1
-            chunk = _make_chunk(doc, article, block, part=str(part_number))
-            if chunk:
-                chunks.append(chunk)
+            # абзац может быть длиннее лимита (в законах часто нет пустых
+            # строк) — режем дополнительно по предложениям
+            for piece in _split_by_sentences(block, MAX_LAW_CHUNK):
+                part_number += 1
+                chunk = _make_chunk(doc, article, piece, part=str(part_number))
+                if chunk:
+                    chunks.append(chunk)
     return chunks
+
+
+def _split_by_sentences(block: str, limit: int) -> list[str]:
+    """Разрезать длинный блок по границам предложений."""
+    block = block.strip()
+    if len(block) <= limit:
+        return [block]
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.;!?])\s+", block) if s.strip()]
+    pieces, current = [], ""
+    for sentence in sentences:
+        if current and len(current) + len(sentence) + 1 > limit:
+            pieces.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip()
+    if current:
+        pieces.append(current)
+    return [piece for piece in pieces if len(piece) >= 30]
 
 
 def chunk_documents(docs: list[dict]) -> list[dict]:
