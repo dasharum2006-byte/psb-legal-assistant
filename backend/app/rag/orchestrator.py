@@ -88,7 +88,7 @@ def analyze_query(question: str) -> dict:
        """Разобрать вопрос: дата, документы, суммы, уточнение это или нет."""                                     
        return {                                                                                                   
            "search_query": expand_query(question),                                                                      
-           "as_of": find_date(question),                                                                          
+           "as_of": find_date(question) if has_temporal_intent(question) else None,                                                                          
            "doc_ids": find_doc_ids(question),                                                                     
            "amounts": [],                                                                                         
            "is_followup": False,                                                                                  
@@ -125,6 +125,30 @@ def build_context(chunks: list[dict], max_chars: int = 6000) -> str:
         
     
 # на входе у нас строка на выходе список строк
+# Временной смысл вопроса: «на какую дату действовало право».
+# Год в номере договора или дате документа сам по себе НЕ означает, что
+# спрашивают про состояние на дату — иначе фильтр as_of отсекал бы
+# актуальные документы на вопросе «договор от 15 марта 2023 года».
+TEMPORAL_PATTERNS = (
+    r"по состоянию на",
+    r"на дату",
+    r"на момент",
+    r"на тот момент",
+    r"\bдействовал",
+    r"\bдействует\b",
+    r"(?<![а-яё])(в|на|с|к|до|за)\s+(?:\d{1,2}\s+)?[а-яё]+\s*20\d{2}",
+    r"(?<![а-яё])(в|на|с|к|до|за)\s+20\d{2}\s*(?:год|году|года)",
+    r"на\s+\d{2}\.\d{2}\.\d{4}",
+    r"\bтогда\b",
+)
+
+
+def has_temporal_intent(question: str) -> bool:
+    """Спрашивают ли про состояние на дату, а не просто упомянули год."""
+    low = question.lower().replace("ё", "е")
+    return any(re.search(pattern, low) for pattern in TEMPORAL_PATTERNS)
+
+
 def find_doc_ids(question: str) -> list[str]:
     # опознаем документ в вопросе по номеру или контрагенту
     text = question.lower().replace("ё","е")
