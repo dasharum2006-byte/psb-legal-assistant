@@ -29,7 +29,9 @@ def test_contract_number_year_is_not_as_of() -> None:
 
 def test_state_on_date_is_as_of() -> None:
     assert analyze_query("Что действовало на 15.04.2025?")["as_of"] == "2025-04-15"
-    assert analyze_query("Правила по состоянию на 1 августа 2024")["as_of"] == "2024-08-01"
+    # точная дата — как есть; месяц с годом — конец периода (так устроен find_date)
+    assert analyze_query("Правила по состоянию на 01.08.2024")["as_of"] == "2024-08-01"
+    assert analyze_query("Правила по состоянию на август 2024")["as_of"] == "2024-08-31"
 
 
 def test_period_questions_are_as_of() -> None:
