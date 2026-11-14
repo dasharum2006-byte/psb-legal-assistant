@@ -128,6 +128,27 @@ def _number(title: str) -> str | None:
     return match.group(1).rstrip(".") if match else None
 
 
+JUNK_NAMES = ("thumbs.db", ".ds_store", "desktop.ini")
+
+
+def _is_junk(name: str) -> bool:
+    """Служебные файлы архивов: macOS, Windows, скрытые."""
+    base = name.rsplit("/", 1)[-1]
+    return (
+        name.startswith("__MACOSX/")
+        or base.startswith("._")
+        or base.startswith(".")
+        or base.lower() in JUNK_NAMES
+    )
+
+
+def _doc_id(filename: str) -> str:
+    """Идентификатор документа: без путей и пробелов."""
+    stem = filename.replace(".txt", "").replace("\\", "/")
+    stem = stem.rsplit("/", 1)[-1]                 # отбрасываем папки внутри архива
+    return stem.replace(" ", "_").lower()
+
+
 def load_documents(kb_path: str) -> list[dict]:
     """Прочитать документы из zip (или папки) с метаданными."""
     documents: list[dict] = []
@@ -135,7 +156,7 @@ def load_documents(kb_path: str) -> list[dict]:
     if kb_path.endswith(".zip"):
         with zipfile.ZipFile(kb_path, "r") as archive:
             for filename in archive.namelist():
-                if not filename.endswith(".txt"):
+                if not filename.endswith(".txt") or _is_junk(filename):
                     continue
                 with archive.open(filename) as handle:
                     text = handle.read().decode("utf-8-sig", errors="replace")
@@ -181,7 +202,7 @@ def _make_document(filename: str, text: str) -> dict:
         title = f"{title} (ред. {revision})"
 
     return {
-        "doc_id": filename.replace(".txt", "").replace(" ", "_").lower(),
+        "doc_id": _doc_id(filename),
         "title": title,
         "doc_type": doc_type,
         "number": _number(title),

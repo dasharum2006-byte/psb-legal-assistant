@@ -291,6 +291,11 @@ def load_documents(path: Path) -> list[dict]:
             suffix = Path(name).suffix.lower()
             if suffix not in {".txt", ".md", ".docx"}:
                 continue
+            # служебные файлы архивов macOS/Windows
+            base = name.rsplit("/", 1)[-1]
+            if (name.startswith("__MACOSX/") or base.startswith((".", "._"))
+                    or base.lower() in ("thumbs.db", "desktop.ini")):
+                continue
             raw = archive.read(name)
             try:
                 text = read_docx(raw) if suffix == ".docx" else raw.decode("utf-8-sig", errors="replace")

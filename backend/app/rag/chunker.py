@@ -135,7 +135,8 @@ def _by_paragraphs(doc: dict, prefix: str = "абз.") -> list[dict]:
 def _by_articles(doc: dict) -> list[dict]:
     """Законы: статья = чанк; слишком длинные статьи режем по абзацам."""
     chunks: list[dict] = []
-    pattern = r"(?m)^\s*(Статья\s+\d+(?:\.\d+)?)"
+    # в выгрузках гаранта строка начинается с «Источник: Статья 70. …»
+    pattern = r"(?m)^\s*(?:Источник:\s*)?(Статья\s+\d+(?:\.\d+)?)"
     parts = re.split(pattern, doc["text"])
 
     for index in range(1, len(parts), 2):
