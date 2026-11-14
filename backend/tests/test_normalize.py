@@ -99,3 +99,40 @@ def test_thousands_words() -> None:
     assert parse_amounts("500 тысяч рублей") == [500_000]
     assert parse_amounts("500 тыс. руб.") == [500_000]
     assert parse_amounts("250 тыс") == [250_000]
+
+
+def test_clause_key_has_no_collisions() -> None:
+    """«ст. 15 ч. 2» и «ст. 15.1» — разные вещи и не должны склеиваться."""
+    from app.rag.normalize import clause_key
+
+    assert clause_key("ст. 15 ч. 2") == "15#2"
+    assert clause_key("ст. 15.1") == "15.1"
+    assert clause_key("ст. 15 ч. 2") != clause_key("ст. 15.1")
+
+
+def test_clause_key_is_format_tolerant() -> None:
+    from app.rag.normalize import clause_key
+
+    assert clause_key("ст.70") == clause_key("ст. 70") == clause_key("статья 70") == "70"
+    assert clause_key("п.3.1") == clause_key("п. 3.1") == clause_key("3.1") == "3.1"
+
+
+def test_verifier_accepts_different_citation_formats() -> None:
+    """Верный ответ не должен отбраковываться из-за написания ссылки."""
+    from app.llm.verifier import Verifier
+
+    law = [{"doc": "Статья 70. Испытание", "clause": "ст. 70", "text": "Срок шесть месяцев"}]
+    for answer in ("Срок шесть месяцев (ст. 70).", "Срок шесть месяцев (статья 70).",
+                   "Срок шесть месяцев (ст.70)."):
+        assert Verifier.verify(answer, law)["ok"] is True, answer
+
+    contract = [{"doc": "ДОГОВОР АРЕНДЫ № А-08/2024", "clause": "3.1", "text": "Плата 450 000"}]
+    assert Verifier.verify("Плата 450 000 (п. 3.1).", contract)["ok"] is True
+    assert Verifier.verify("Плата 450 000 (п.3.1).", contract)["ok"] is True
+
+
+def test_verifier_rejects_invented_citation() -> None:
+    from app.llm.verifier import Verifier
+
+    contract = [{"doc": "ДОГОВОР АРЕНДЫ № А-08/2024", "clause": "3.1", "text": "Плата 450 000"}]
+    assert Verifier.verify("Плата 450 000 (п. 9.9).", contract)["ok"] is False

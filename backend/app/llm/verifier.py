@@ -1,5 +1,7 @@
 from typing import Dict, Any, List
 
+from app.rag.normalize import clause_key, clause_keys, keys_match
+
 
 class Verifier:
     @staticmethod
@@ -63,16 +65,28 @@ class Verifier:
         # 3. Проверка цитирования / наличия ссылок на пункты, если это не отказ
         if not is_refusal:
             # Проверяем, упоминаются ли пункты, статьи или названия документов из чанков в тексте ответа
+            # Ссылки сравниваем по каноническим ключам: «ст.70», «статья 70»
+            # и «ст. 70» — одно и то же. Раньше сравнение было буквальным,
+            # и верный ответ отбраковывался из-за другого написания.
+            answer_keys = clause_keys(answer)
             source_matched = False
             for chunk in chunks:
-                clause = chunk.get("clause", "")
-                doc = chunk.get("doc", "")
-                if (clause and clause.lower() in answer_lower) or (doc and doc.lower() in answer_lower):
+                chunk_key = clause_key(chunk.get("clause", ""))
+                if chunk_key and any(
+                    keys_match(key, chunk_key) for key in answer_keys
+                ):
+                    source_matched = True
+                    break
+                doc = (chunk.get("doc") or "").lower()
+                if doc and doc in answer_lower:
                     source_matched = True
                     break
 
             if not source_matched and len(chunks) > 0:
-                unsupported_claims.append("Ответ не содержит ссылок на конкретные пункты или документы из базы.")
+                unsupported_claims.append(
+                    f"Ответ не содержит ссылок на пункты из базы. "
+                    f"В контексте были: {sorted({c.get('clause','') for c in chunks})[:5]}"
+                )
 
         ok = not injection_suspected and (is_refusal or len(unsupported_claims) == 0)
 

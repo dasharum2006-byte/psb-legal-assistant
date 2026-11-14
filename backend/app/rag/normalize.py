@@ -66,6 +66,63 @@ def parse_amounts(text: str) -> list[int]:
     return amounts
 
 
+_ARTICLE_RE = re.compile(r"(?:ст\.|стать[яиею])\s*(\d+(?:\.\d+)*)")
+_PART_RE = re.compile(r"(?:ч\.|част(?:ь|и))\s*(\d+)")
+_POINT_RE = re.compile(r"(?:п\.|пункт(?:а|е|ом)?)\s*(\d+(?:\.\d+)*)")
+
+
+def clause_key(text: str) -> str | None:
+    """Канонический ключ ссылки, без коллизий.
+
+    «ст. 15 ч. 2» -> «15#2»   (часть статьи)
+    «ст. 15.1»    -> «15.1»   (отдельная статья Кодекса)
+    «п. 3.1»      -> «3.1»
+
+    normalize_clause() склеивала часть через точку и давала одинаковый
+    результат для «ст. 15.1» и «ст. 15 ч. 2».
+    """
+    if not text:
+        return None
+    low = normalize_text(text)
+
+    article = _ARTICLE_RE.search(low)
+    part = _PART_RE.search(low)
+    if article:
+        return f"{article.group(1)}#{part.group(1)}" if part else article.group(1)
+
+    point = _POINT_RE.search(low)
+    if point:
+        return point.group(1)
+    if part:
+        return f"#{part.group(1)}"
+
+    # чанкер хранит номер без префикса: clause = "3.1" или "ст. 70"
+    bare = re.fullmatch(r"\s*(\d+(?:\.\d+)*)\s*", low)
+    if bare:
+        return bare.group(1)
+    return None
+
+
+def clause_keys(text: str) -> set[str]:
+    """Все ключи ссылок, встречающихся в тексте (для проверки ответа)."""
+    if not text:
+        return set()
+    low = normalize_text(text)
+    keys = {match.group(1) for match in _POINT_RE.finditer(low)}
+    keys |= {match.group(1) for match in _ARTICLE_RE.finditer(low)}
+    return keys
+
+
+def keys_match(answer_key: str, chunk_key: str) -> bool:
+    """Ссылка из ответа подтверждается чанком (или его более общим уровнем)."""
+    if not answer_key or not chunk_key:
+        return False
+    if answer_key == chunk_key:
+        return True
+    # «ст. 15» подтверждается чанком «ст. 15.1» (ссылка на статью целиком)
+    return chunk_key.startswith(answer_key + ".") or answer_key.startswith(chunk_key + "#")
+
+
 def normalize_clause(text: str) -> str | None:
     """Извлечь номер первого пункта, статьи или части."""
     match = _CLAUSE.search(normalize_text(text))

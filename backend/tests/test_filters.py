@@ -25,8 +25,13 @@ class FakeClient:
 
     def generate(self, prompt, system=None, **kwargs):
         import re
-        clause = re.search(r"пункт/статья:\s*(ст\. \d+|\d+(?:\.\d+)*)", prompt)
-        return f"Согласно документам, условие действует ({clause.group(1)})." if clause else "Не нашёл."
+        # шапка промпта: «Источник: <док>, раздел «…», пункт: 3.1» или «пункт/статья: ст. 70»
+        clause = re.search(r"(?:пункт/статья|пункт|статья):\s*([^,\n]+)", prompt)
+        if not clause:
+            return "Не нашёл."
+        value = clause.group(1).strip()
+        citation = f"({value})" if value.startswith("ст.") else f"(п. {value})"
+        return f"Согласно документам, условие действует {citation}."
 
 
 CHUNKS = [
