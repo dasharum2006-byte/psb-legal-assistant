@@ -36,7 +36,13 @@ def _base(doc: dict) -> dict:
     }
 
 
-def _make_chunk(doc: dict, clause: str, text: str, part: str | None = None) -> dict | None:
+def _make_chunk(
+    doc: dict,
+    clause: str,
+    text: str,
+    part: str | None = None,
+    section: str = "",
+) -> dict | None:
     body = re.sub(r"[ \t]+", " ", text).strip()
     if len(body) < 30:
         return None
@@ -47,7 +53,8 @@ def _make_chunk(doc: dict, clause: str, text: str, part: str | None = None) -> d
     chunk["suspicious_instruction"] = any(
         pattern in body.lower() for pattern in INJECTION_PATTERNS
     )
-    chunk["searchable"] = f"{doc['title']} {clause} {body}"
+    chunk["section"] = section
+    chunk["searchable"] = f"{doc['title']} {section} {clause} {body}".strip()
     if part:
         chunk["chunk_id"] = f"{doc['doc_id']}#{clause}/{part}"
     else:
@@ -84,9 +91,8 @@ def _by_clauses(doc: dict) -> list[dict]:
             else:
                 break
 
-        chunk = _make_chunk(doc, match.group(1), body)
+        chunk = _make_chunk(doc, match.group(1), body, section=section)
         if chunk:
-            chunk["section"] = section
             chunks.append(chunk)
     return chunks
 

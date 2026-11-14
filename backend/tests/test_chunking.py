@@ -50,7 +50,7 @@ def test_single_level_numbering_supported() -> None:
     assert {"1", "2"} <= clauses(chunks), f"пункты 1 и 2 должны найтись, есть {clauses(chunks)}"
 
 
-def test_section_title_is_stored_but_not_in_searchable() -> None:
+def test_section_title_is_stored_and_searchable() -> None:
     text = (
         "ДОГОВОР № 3\n"
         "3. Арендная плата\n"
@@ -59,8 +59,8 @@ def test_section_title_is_stored_but_not_in_searchable() -> None:
     chunks = sol.chunk_documents([_doc(text)])
     chunk = next(c for c in chunks if c["clause"] == "3.1")
     assert chunk["section"].startswith("3.")
-    # раздел не должен зашумлять поиск
-    assert "Арендная плата 3.1" not in chunk["searchable"]
+    # раздел участвует в поиске: по нему находят пункты по теме вопроса
+    assert "Арендная плата" in chunk["searchable"]
 
 
 def test_law_is_split_by_articles_not_by_numbered_parts() -> None:

@@ -380,9 +380,9 @@ def chunk_documents(documents: list[dict]) -> list[dict]:
                 "section": section,
                 "text": text,
                 "repealed": doc["repealed"],
-                # раздел НЕ кладём в searchable: слова вроде «Предмет договора»
-                # есть во всех договорах и только зашумляют поиск
-                "searchable": f"{doc['title']} {item['clause']} {text}".strip(),
+                # название раздела помогает находить пункты по теме вопроса
+                # («ответственность сторон», «арендная плата»)
+                "searchable": f"{doc['title']} {section} {item['clause']} {text}".strip(),
             })
 
     for doc in documents:
