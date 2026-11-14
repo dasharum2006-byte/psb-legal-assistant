@@ -132,3 +132,23 @@ def test_bare_section_heading_is_not_a_clause() -> None:
     chunks = sol.chunk_documents([_doc(text)])
     bare = [c for c in chunks if len(c["text"]) < 25]
     assert not bare, f"в чанки попали голые заголовки: {[(c['clause'], c['text']) for c in bare]}"
+
+
+def test_prompt_includes_dialog_history() -> None:
+    """Уточняющий вопрос без истории модель понять не может."""
+    chunks = [{"doc": "ДОГОВОР ПОСТАВКИ № П-17/2024", "clause": "6.1", "section": "",
+               "text": "Приёмка по качеству 5 рабочих дней.", "repealed": False}]
+    prompt = sol.build_prompt(
+        "А за сколько дней проверить качество?",
+        chunks,
+        "пользователь: какой гарантийный срок по договору с Альфа-Трейд?",
+    )
+    assert "ИСТОРИЯ ДИАЛОГА" in prompt
+    assert "Альфа-Трейд" in prompt
+    assert "ВОПРОС: А за сколько дней проверить качество?" in prompt
+
+
+def test_prompt_without_history_has_no_history_block() -> None:
+    chunks = [{"doc": "Д", "clause": "1.1", "section": "", "text": "текст", "repealed": False}]
+    prompt = sol.build_prompt("вопрос", chunks)
+    assert "ИСТОРИЯ ДИАЛОГА" not in prompt

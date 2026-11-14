@@ -872,14 +872,21 @@ SYSTEM_PROMPT = (
 )
 
 
-def build_prompt(question: str, chunks: list[dict]) -> str:
+def build_prompt(question: str, chunks: list[dict], history: str = "") -> str:
+    """Контекст + история диалога + вопрос.
+
+    Без истории уточняющие вопросы («А за сколько дней после поставки?»)
+    модель понимает неверно: непонятно, о каком договоре речь.
+    """
     parts = []
     for index, chunk in enumerate(chunks, 1):
         mark = " [УТРАТИЛА СИЛУ]" if chunk.get("repealed") else ""
         section = chunk.get("section")
         where = f"раздел «{section}», п. {chunk['clause']}" if section else f"п. {chunk['clause']}"
         parts.append(f"[{index}] «{chunk['doc']}», {where}{mark}\n{chunk['text']}")
-    return "КОНТЕКСТ:\n" + "\n\n".join(parts) + f"\n\nВОПРОС: {question}\n\nОТВЕТ:"
+    history_section = f"\n\nИСТОРИЯ ДИАЛОГА:\n{history}" if history.strip() else ""
+    return ("КОНТЕКСТ:\n" + "\n\n".join(parts) + history_section
+            + f"\n\nВОПРОС: {question}\n\nОТВЕТ:")
 
 
 def split_dialog(raw: str) -> tuple[str, str]:
@@ -955,7 +962,12 @@ def _citation(chunk: dict) -> str:
     return f"(п. {clause})"
 
 
-def ask_llm(client: httpx.Client, question: str, chunks: list[dict]) -> str | None:
+def ask_llm(
+    client: httpx.Client,
+    question: str,
+    chunks: list[dict],
+    history: str = "",
+) -> str | None:
     if not api_available():
         return None
 
@@ -967,7 +979,7 @@ def ask_llm(client: httpx.Client, question: str, chunks: list[dict]) -> str | No
             "max_tokens": budget,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": build_prompt(question, chunks)},
+                {"role": "user", "content": build_prompt(question, chunks, history)},
             ],
         }
         try:
@@ -1077,7 +1089,12 @@ def _second_pass(
     return rerank_chunks(client, question, ordered)
 
 
-def answer_question(client: httpx.Client | None, question: str, retriever: Retriever) -> str:
+def answer_question(
+    client: httpx.Client | None,
+    question: str,
+    retriever: Retriever,
+    history: str = "",
+) -> str:
     search_text = expand_query(question)
     candidates = [chunk for chunk in retriever.search(search_text) if chunk["score"] >= MIN_SCORE]
 
@@ -1139,7 +1156,7 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
                         "repealed": selected[0].get("repealed", False),
                     })
         selected = with_neighbours(selected, retriever.chunks)
-        text = ask_llm(client, question, selected)
+        text = ask_llm(client, question, selected, history)
 
         if text is None:
             # LLM не ответила: пробуем второй поиск — возможно, дело в контексте
@@ -1147,7 +1164,7 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
             if time.time() - RUN_STARTED < DEADLINE_SECONDS * 0.9:
                 retry_selected = _second_pass(client, question, retriever, selected)
                 if retry_selected:
-                    second = ask_llm(client, question, retry_selected)
+                    second = ask_llm(client, question, retry_selected, history)
                     if second:
                         second = _ensure_citation(second, retry_selected)
                         if _grounded(second, retry_selected) and not INSUFFICIENT.search(second):
@@ -1164,7 +1181,7 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
             if time.time() - RUN_STARTED < DEADLINE_SECONDS * 0.9:
                 retry_selected = _second_pass(client, question, retriever, selected)
                 if retry_selected:
-                    second = ask_llm(client, question, retry_selected)
+                    second = ask_llm(client, question, retry_selected, history)
                     if second:
                         second = _ensure_citation(second, retry_selected)
                         if _grounded(second, retry_selected) and not INSUFFICIENT.search(second):
@@ -1227,7 +1244,9 @@ def main() -> None:
         history, last_question = split_dialog(question)
         search_text = f"{history} {last_question}".strip() if history else last_question
         try:
-            return position, answer_question(shared_client, search_text, retriever)
+            # поиск — по склейке (нужен контекст), ответ — по последней реплике
+            # плюс отдельный блок истории для модели
+            return position, answer_question(shared_client, last_question, retriever, history)
         except Exception as exc:
             DEGRADE["исключение"] += 1
             print(f"вопрос {position}: {type(exc).__name__}: {exc}", file=sys.stderr)

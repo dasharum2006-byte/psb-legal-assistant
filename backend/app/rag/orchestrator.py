@@ -346,7 +346,7 @@ def ask(
     # 4. генерация
     client = client or LLMClient()
     try:
-        answer = client.generate(build_rag_prompt(question, picked))
+        answer = client.generate(build_rag_prompt(question, picked, history))
     except Exception:
         return _refusal("llm_unavailable")
 

@@ -69,3 +69,16 @@ def cleanup_overrides():
     yield
     app.dependency_overrides.clear()
     app.dependency_overrides[get_retriever] = mock_get_retriever
+
+def test_prompt_builder_includes_history() -> None:
+    """История диалога должна попадать в промпт для модели."""
+    from app.llm.prompt import build_rag_prompt
+
+    chunks = [{"doc": "ДОГОВОР № 1", "clause": "1.1", "text": "Условие."}]
+    history = [{"role": "user", "text": "вопрос про аренду"},
+               {"role": "assistant", "text": "ответ про аренду"}]
+
+    prompt = build_rag_prompt("А до какого числа платить?", chunks, history)
+    assert "ИСТОРИЯ ДИАЛОГА" in prompt
+    assert "вопрос про аренду" in prompt
+    assert "А до какого числа платить?" in prompt

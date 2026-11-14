@@ -59,16 +59,38 @@ def _source_header(chunk: dict) -> str:
     return f"Источник: {doc}, {where}{suffix}"
 
 
-def build_rag_prompt(question: str, chunks: list[dict]) -> str:
-    """Собрать промпт: контекст + вопрос + напоминание о формате."""
+def _history_block(history: list[dict] | None, limit: int = 6) -> str:
+    """Последние реплики диалога: по ним понятно, о чём уточняющий вопрос."""
+    if not history:
+        return ""
+    recent = [item for item in history if (item.get("text") or "").strip()][-limit:]
+    if not recent:
+        return ""
+    lines = []
+    for item in recent:
+        role = "Пользователь" if item.get("role") == "user" else "Ассистент"
+        lines.append(f"{role}: {item['text'].strip()[:400]}")
+    return "\n".join(lines)
+
+
+def build_rag_prompt(
+    question: str,
+    chunks: list[dict],
+    history: list[dict] | None = None,
+) -> str:
+    """Собрать промпт: контекст + история диалога + вопрос."""
     parts = []
     for index, chunk in enumerate(chunks, 1):
         text = chunk.get("text", "").strip()
         parts.append(f"--- Документ {index} ---\n{_source_header(chunk)}\n{text}")
 
+    history_text = _history_block(history)
+    history_section = f"\n\nИСТОРИЯ ДИАЛОГА:\n{history_text}" if history_text else ""
+
     return (
         "КОНТЕКСТ ДЛЯ АНАЛИЗА:\n"
         + "\n\n".join(parts)
+        + history_section
         + f"\n\nВОПРОС ПОЛЬЗОВАТЕЛЯ:\n{question}\n\n"
         "Ответь по контексту, 2-4 предложения, каждый факт со ссылкой на пункт. "
         "Если ответа в контексте нет — скажи, чего именно не хватает."
