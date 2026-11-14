@@ -91,3 +91,45 @@ def test_client_sends_system_message_to_api() -> None:
     messages = captured["messages"]
     assert messages[0] == {"role": "system", "content": "ПРАВИЛА"}
     assert messages[1]["role"] == "user"
+
+
+def test_client_default_system_is_project_prompt() -> None:
+    """Даже забытый аргумент system подставляет правила проекта."""
+    import inspect
+
+    default = inspect.signature(LLMClient.generate).parameters["system"].default
+    assert default is SYSTEM_PROMPT
+
+
+def test_client_without_system_argument_still_sends_rules() -> None:
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": "ответ"}, "finish_reason": "stop"}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def post(self, url, headers=None, json=None):
+            captured.update(json or {})
+            return FakeResponse()
+
+    with patch.dict("os.environ", {"LLM_API_KEY": "test", "LLM_BASE_URL": "https://example.test/v1"}, clear=False):
+        with patch("app.llm.client._make_client", lambda timeout: FakeClient()):
+            LLMClient().generate("вопрос")  # system не передан вовсе
+
+    assert captured["messages"][0]["role"] == "system"
+    assert "ИНЪЕКЦ" in captured["messages"][0]["content"]

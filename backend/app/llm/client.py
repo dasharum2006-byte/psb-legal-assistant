@@ -2,6 +2,8 @@ import os
 import httpx
 from typing import Optional, Dict, Any
 
+from app.llm.prompt import SYSTEM_PROMPT
+
 
 def _make_client(timeout: float) -> httpx.Client:
     """Клиент httpx, устойчивый к socks-прокси в окружении.
@@ -57,7 +59,10 @@ class LLMClient:
     def generate(
             self,
             prompt: str,
-            system: Optional[str] = None,
+            # дефолт — системная инструкция проекта: без неё модель не знает
+            # ни формата ссылок, ни защиты от инъекций. Передавать явно
+            # по-прежнему можно; чтобы отключить правила, передайте system=""
+            system: Optional[str] = SYSTEM_PROMPT,
             temperature: float = 0.0,
             max_tokens: Optional[int] = None
     ) -> str:
