@@ -22,6 +22,17 @@ cd backend && pip install -r requirements.txt && uvicorn app.main:app --reload
 cd frontend && npm install && npm run dev
 ```
 
+**Важно:** после правок в `backend/app/rag/parser.py` или `chunker.py`
+пересоберите индекс, иначе сервер будет работать на старых чанках:
+
+```bash
+.venv/bin/python scripts/build_index.py data/knowledge-base.zip
+```
+
+Сервер проверяет отпечаток кода нарезки: если индекс собран другим кодом,
+в `/api/health` появится `index_stale` с просьбой пересобрать, а тест
+`backend/tests/test_index_freshness.py` упадёт.
+
 Проверка: `curl localhost:8000/api/health`
 
 ## Ветки и процесс
