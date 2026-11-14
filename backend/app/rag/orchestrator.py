@@ -316,8 +316,20 @@ def _refusal(reason: str, missing: list[str] | None = None) -> dict:
 
 
 def pick_sources(answer: str, chunks: list[dict], limit: int = 3) -> list[dict]:
-    """Оставить только те источники, на которые ответ реально ссылается."""
-    cited = [chunk for chunk in chunks if chunk["clause"] and chunk["clause"] in answer]
+    """Оставить только те источники, на которые ответ реально ссылается.
+
+    Сравниваем по каноническим ключам ссылок: «статья 15», «ст.15» и
+    «ст. 15» — это одна и та же ссылка. Раньше сравнение было буквальным,
+    и в источники попадало всё, кроме нужного.
+    """
+    from app.rag.normalize import clause_key, clause_keys, keys_match
+
+    answer_keys = clause_keys(answer)
+    cited = [
+        chunk for chunk in chunks
+        if chunk.get("clause")
+        and any(keys_match(key, clause_key(chunk["clause"]) or "") for key in answer_keys)
+    ]
     chosen = (cited or chunks)[:limit]
     return [
         {
