@@ -3,6 +3,28 @@ import httpx
 from typing import Optional, Dict, Any
 
 
+def _make_client(timeout: float) -> httpx.Client:
+    """Клиент httpx, устойчивый к socks-прокси в окружении.
+
+    httpx не умеет SOCKS без доп. пакета и падает на этапе создания клиента.
+    Тогда берём http-прокси из HTTPS_PROXY/HTTP_PROXY или идём без прокси.
+    """
+    try:
+        return httpx.Client(timeout=timeout)
+    except Exception:
+        pass
+
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        value = (os.getenv(name) or "").strip()
+        if value.startswith(("http://", "https://")):
+            try:
+                return httpx.Client(timeout=timeout, proxy=value)
+            except Exception:
+                continue
+
+    return httpx.Client(timeout=timeout, trust_env=False)
+
+
 class LLMClientError(Exception):
     """Базовое исключение для ошибок клиента LLM."""
     pass
@@ -68,7 +90,7 @@ class LLMClient:
 
         for attempt in range(1, max_retries + 1):
             try:
-                with httpx.Client(timeout=self.timeout) as client:
+                with _make_client(self.timeout) as client:
                     response = client.post(url, headers=headers, json=payload)
 
                     if response.status_code == 429 or response.status_code >= 500:

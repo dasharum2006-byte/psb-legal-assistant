@@ -73,7 +73,14 @@ async def chat_endpoint(
         from app.rag.orchestrator import ask
 
         result = await asyncio.wait_for(
-            asyncio.to_thread(ask, request.message, request.history, retriever),
+            asyncio.to_thread(
+                ask,
+                request.message,
+                request.history,
+                retriever,
+                None,                    # client=LLMClient() по умолчанию
+                request.filters,         # фильтры из запроса больше не теряются
+            ),
             timeout=settings.REQUEST_TIMEOUT
         )
 

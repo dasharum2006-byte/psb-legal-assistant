@@ -209,6 +209,9 @@ def _adapt(chunk: dict) -> dict:
     return {
         "doc": chunk.get("doc") or chunk.get("title", ""),
         "doc_id": chunk.get("doc_id", ""),
+        "doc_type": chunk.get("doc_type"),
+        "number": chunk.get("number"),
+        "revision": chunk.get("revision"),
         "clause": clause,
         "text": chunk.get("text", ""),
         "score": float(chunk.get("score", 0)),
@@ -218,13 +221,30 @@ def _adapt(chunk: dict) -> dict:
     }
 
 
-def _post_filter(chunks: list[dict], analysis: dict) -> list[dict]:
-    """Фильтры на нашей стороне: пока поиск их не поддерживает."""
-    doc_ids = [d.lower().replace("/", "-") for d in analysis.get("doc_ids") or []]
-    as_of = analysis.get("as_of")
+def _post_filter(chunks: list[dict], analysis: dict, filters: dict | None = None) -> list[dict]:
+    """Фильтры поиска: из разбора вопроса И из запроса API.
+
+    filters из запроса: doc_ids, doc_type, status, as_of.
+    """
+    filters = filters or {}
+
+    doc_ids = [d.lower().replace("/", "-") for d in (analysis.get("doc_ids") or [])]
+    doc_ids += [str(d).lower().replace("/", "-") for d in (filters.get("doc_ids") or [])]
+
+    as_of = filters.get("as_of") or analysis.get("as_of")
+    doc_types = {str(t).lower() for t in (filters.get("doc_type") or [])} if filters.get("doc_type") else set()
+    statuses = {str(s).lower() for s in (filters.get("status") or [])} if filters.get("status") else set()
 
     result = []
     for chunk in chunks:
+        if doc_types:
+            chunk_type = str(chunk.get("doc_type") or "").lower()
+            if chunk_type not in doc_types:
+                continue
+        if statuses:
+            chunk_status = str(chunk.get("status") or "").lower()
+            if chunk_status not in statuses:
+                continue
         if doc_ids:
             haystack = f"{chunk['doc_id']} {chunk['doc']}".lower().replace("/", "-")
             if not any(doc_id in haystack for doc_id in doc_ids):
@@ -269,8 +289,18 @@ def pick_sources(answer: str, chunks: list[dict], limit: int = 3) -> list[dict]:
     ]
 
 
-def ask(question: str, history: list[dict], retriever, client=None) -> dict:
-    """Главный вход: разбор -> поиск -> отбор -> LLM -> проверка -> ответ или отказ."""
+def ask(
+    question: str,
+    history: list[dict],
+    retriever,
+    client=None,
+    filters: dict | None = None,
+) -> dict:
+    """Главный вход: разбор -> поиск -> отбор -> LLM -> проверка -> ответ или отказ.
+
+    filters приходят из запроса API: {"doc_ids": [...], "doc_type": [...],
+    "status": ["active"], "as_of": "2024-08-31"}.
+    """
     from app.llm.client import LLMClient
     from app.llm.prompt import build_rag_prompt
     from app.llm.verifier import Verifier
@@ -283,7 +313,7 @@ def ask(question: str, history: list[dict], retriever, client=None) -> dict:
     except Exception:
         return _refusal("llm_unavailable")
 
-    chunks = _post_filter([_adapt(chunk) for chunk in raw], analysis)
+    chunks = _post_filter([_adapt(chunk) for chunk in raw], analysis, filters)
 
     # 2. порог: всё слабее MIN_SCORE — считаем, что не нашли
     chunks = [chunk for chunk in chunks if chunk["score"] >= MIN_SCORE]
