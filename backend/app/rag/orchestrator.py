@@ -17,6 +17,11 @@ import os
 # Если переключимся на гибрид с очками 0..1 — поставить 0.25.
 MIN_SCORE = float(os.getenv("MIN_SCORE", "8"))
 
+# Сколько кандидатов забирать из поиска ДО фильтров. Фильтры (doc_ids,
+# doc_type, status, as_of) применяются после поиска и могут отсечь всё,
+# если нужный документ оказался на 9-15 месте. Поэтому берём с запасом.
+SEARCH_CANDIDATES = int(os.getenv("SEARCH_CANDIDATES", "40"))
+
 # Доменные подсказки: слова из вопроса -> слова из документов.
 # Нужны, потому что люди говорят «платить», а в договоре «арендная плата».
 SYNONYMS = {
@@ -309,7 +314,7 @@ def ask(
 
     # 1. поиск
     try:
-        raw = retriever.search(analysis["search_query"], 8)
+        raw = retriever.search(analysis["search_query"], SEARCH_CANDIDATES)
     except Exception:
         return _refusal("llm_unavailable")
 

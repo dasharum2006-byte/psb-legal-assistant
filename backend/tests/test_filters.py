@@ -83,3 +83,35 @@ def test_no_filters_keeps_everything() -> None:
     result = run("общий вопрос про документы", {})
     assert result["refusal"] is False
     assert len(docs_in(result)) >= 1
+
+
+class DeepRetriever:
+    """Правильный документ лежит глубоко в выдаче — на 15-м месте."""
+
+    def __init__(self, total: int = 30, target_at: int = 14):
+        self.total = total
+        self.target_at = target_at
+
+    def search(self, query, k=8, filters=None):
+        chunks = []
+        for position in range(self.total):
+            is_target = position == self.target_at
+            chunks.append({
+                "doc_id": "target_doc" if is_target else f"noise_{position}",
+                "doc": "РЕГЛАМЕНТ (ред. 2025)" if is_target else f"Шум {position}",
+                "doc_type": "regulation" if is_target else "contract",
+                "clause": "1.3" if is_target else "1.1",
+                "text": "Инициатором согласования является руководитель подразделения." if is_target
+                        else "Посторонний текст про аренду и поставку.",
+                "score": 30.0 - position,
+                "status": "active",
+            })
+        return chunks[:k]
+
+
+def test_filter_finds_document_beyond_first_eight() -> None:
+    """Раньше поиск брал 8 кандидатов, фильтр их выкидывал и был отказ."""
+    result = ask("кто запускает согласование?", [], DeepRetriever(), client=FakeClient(),
+                 filters={"doc_type": ["regulation"]})
+    assert result["refusal"] is False, "верный документ был на 15-м месте и не нашёлся"
+    assert result["sources"][0]["doc"] == "РЕГЛАМЕНТ (ред. 2025)"
