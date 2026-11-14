@@ -83,10 +83,11 @@ def _validity(text: str) -> tuple[str | None, str | None, str]:
     if active_since:
         valid_from = f"{active_since.group(3)}-{active_since.group(2)}-{active_since.group(1)}"
 
-    if valid_to and not valid_from:
-        status = "repealed"
-    else:
-        status = "active"
+    # Сама фраза «редакция утратила силу с <дата>» уже означает отмену.
+    # Раньше условие требовало отсутствия valid_from: если в шапке были обе
+    # фразы («действует с 2023» и «утратила силу с 2025»), документ
+    # ошибочно получал status="active".
+    status = "repealed" if valid_to else "active"
     return valid_from, valid_to, status
 
 
