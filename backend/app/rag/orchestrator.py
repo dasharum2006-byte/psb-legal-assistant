@@ -397,7 +397,20 @@ def ask(
 
     # 5. проверка ответа
     verdict = Verifier.verify(answer, picked, question)
-    if not verdict.get("ok") or verdict.get("refusal"):
+
+    # Модель корректно отказалась: сохраняем её формулировку с объяснением,
+    # чего не хватает. Шаблонная заглушка теряет эту информацию и хуже
+    # оценивается судьёй.
+    if verdict.get("refusal") and not verdict.get("injection_suspected"):
+        text = answer.strip()
+        return {
+            "answer": text or _refusal("no_chunks")["answer"],
+            "sources": [],
+            "refusal": True,
+            "missing_info": verdict.get("missing_info") or [text],
+        }
+
+    if not verdict.get("ok"):
         missing = verdict.get("missing_info") or verdict.get("unsupported")
         return _refusal("unsupported", missing)
 
