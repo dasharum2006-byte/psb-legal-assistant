@@ -47,7 +47,8 @@ class LLMClient:
         self.api_base = (os.getenv("LLM_BASE_URL") or os.getenv("LLM_API_BASE") or "").rstrip("/")
         self.api_key = os.getenv("LLM_API_KEY", "")
         self.model = os.getenv("LLM_MODEL", "gpt-4o-mini")
-        self.timeout = float(os.getenv("LLM_TIMEOUT", "30.0"))
+        self.timeout = float(os.getenv("LLM_TIMEOUT", "25.0"))
+        self.max_retries = int(os.getenv("LLM_RETRIES", "2"))
 
         if not self.api_key:
             # Предупреждение или ошибка, если ключ отсутствует
@@ -85,7 +86,8 @@ class LLMClient:
 
         # Безопасность: НИКОГДА не логируем self.api_key, prompt и system текст (персональные/юридические данные)
 
-        max_retries = 3
+        # бюджет: 25 * 2 + 1 = 51 с < REQUEST_TIMEOUT (60 с)
+        max_retries = self.max_retries
         backoff_factor = 1.0
 
         for attempt in range(1, max_retries + 1):
