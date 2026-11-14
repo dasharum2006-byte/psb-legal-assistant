@@ -91,6 +91,8 @@ RUN_STARTED = time.time()
 MAX_ANSWER_CHARS = 10000
 SNIPPET_CHARS = 1400
 USE_RERANK = env("USE_RERANK", "1") == "1"
+# добавлять ли текст документа целиком (как делает baseline) — эксперимент
+USE_FULL_DOC = env("USE_FULL_DOC", "0") == "1"
 
 _PROXY_WARNED = False
 
@@ -1012,6 +1014,22 @@ def answer_question(client: httpx.Client | None, question: str, retriever: Retri
                 selected.append(chunk)
                 seen.add((chunk["doc"], chunk["clause"]))
         selected = selected[: RERANKER_TOP_N + 2]
+
+        if USE_FULL_DOC:
+            # baseline видит документ целиком; даём модели тот же шанс —
+            # но только по документу, который уже признан релевантным
+            top_doc = selected[0]["doc"] if selected else None
+            if top_doc:
+                full_text = " ".join(
+                    chunk["text"] for chunk in retriever.chunks if chunk["doc"] == top_doc
+                )
+                if full_text and len(full_text) > 400:
+                    selected.append({
+                        "doc": top_doc,
+                        "clause": "текст документа",
+                        "text": full_text[:3000],
+                        "repealed": selected[0].get("repealed", False),
+                    })
         selected = with_neighbours(selected, retriever.chunks)
         text = ask_llm(client, question, selected)
 
