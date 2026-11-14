@@ -105,3 +105,30 @@ def test_section_present_in_prompt() -> None:
                "text": "За просрочку начисляется пеня.", "repealed": False}]
     prompt = sol.build_prompt("какая пеня?", chunks)
     assert "Ответственность сторон" in prompt
+
+
+def test_short_but_important_clause_is_kept() -> None:
+    """Пункт «3.5. НДС не облагается.» (23 символа) не должен теряться."""
+    text = (
+        "ДОГОВОР № 5\n"
+        "3. Цена и порядок расчётов\n"
+        "3.1. Цена товара указывается в спецификации и включает упаковку и доставку.\n"
+        "3.5. НДС не облагается.\n"
+    )
+    chunks = sol.chunk_documents([_doc(text)])
+    assert "3.5" in clauses(chunks), f"короткий пункт потерян, есть {clauses(chunks)}"
+    chunk = next(c for c in chunks if c["clause"] == "3.5")
+    assert "НДС" in chunk["text"]
+
+
+def test_bare_section_heading_is_not_a_clause() -> None:
+    """Заголовок раздела в одноуровневой нумерации не должен стать пунктом."""
+    text = (
+        "ДОГОВОР № 6\n"
+        "1. Общие положения\n"
+        "2. Предмет договора\n"
+        "2.1. Поставщик передаёт покупателю товар в течение десяти рабочих дней.\n"
+    )
+    chunks = sol.chunk_documents([_doc(text)])
+    bare = [c for c in chunks if len(c["text"]) < 25]
+    assert not bare, f"в чанки попали голые заголовки: {[(c['clause'], c['text']) for c in bare]}"

@@ -44,7 +44,7 @@ def _make_chunk(
     section: str = "",
 ) -> dict | None:
     body = re.sub(r"[ \t]+", " ", text).strip()
-    if len(body) < 30:
+    if len(body) < 15:
         return None
 
     chunk = _base(doc)
@@ -98,7 +98,7 @@ def _by_clauses(doc: dict) -> list[dict]:
     for position, match in enumerate(matches):
         end = matches[position + 1].start() if position + 1 < len(matches) else len(text)
         body = _strip_headings(text[match.end():end])
-        if len(body.strip()) < (120 if single_level else 30):
+        if len(body.strip()) < (120 if single_level else 15):
             continue
 
         section = ""

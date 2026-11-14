@@ -426,7 +426,10 @@ def chunk_documents(documents: list[dict]) -> list[dict]:
             end = matches[position + 1].start() if position + 1 < len(matches) else len(text)
             body = re.sub(r"\s+", " ", _strip_headings(text[match.end():end])).strip()
             # у одноуровневых пунктов тело заголовка короткое — такие не берём
-            if len(body) < (60 if single_level else 30):
+            # 15 символов: короткие пункты вроде «3.5. НДС не облагается.» тоже нужны.
+            # Для одноуровневой нумерации порог выше — иначе заголовки разделов
+            # («1. Общие положения») попадут в чанки как пункты.
+            if len(body) < (60 if single_level else 15):
                 continue
             produced.append({
                 "clause": match.group(1),
