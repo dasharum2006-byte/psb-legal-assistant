@@ -32,6 +32,26 @@ def normalize_text(text: str) -> str:
     return " ".join(text.lower().replace("ё", "е").translate(_SEPARATORS).split())
 
 
+_ENDINGS = (
+    "иями", "ями", "ами", "ов", "ев", "ий", "ый", "ая", "ое", "ые", "ой",
+    "ей", "ам", "ям", "ах", "ях", "ию", "ия", "ью", "ом", "ем",
+    "а", "я", "ы", "и", "о", "е", "у", "ю", "ь",
+)
+
+
+def stem(word: str) -> str:
+    """Грубая основа слова без тяжёлых моделей.
+
+    «расторжения», «расторжении», «расторжение» -> «растор»
+    Без этого BM25 считает формы одного слова разными словами.
+    """
+    for ending in _ENDINGS:
+        if word.endswith(ending) and len(word) - len(ending) >= 4:
+            word = word[: -len(ending)]
+            break
+    return word[:6] if len(word) > 6 else word
+
+
 def tokens(text: str) -> list[str]:
     """Разбить текст на токены, сохраняя дефисы внутри обозначений."""
     return re.findall(r"[^\W_]+(?:-+[^\W_]+)*", normalize_text(text))

@@ -48,3 +48,26 @@ def test_search_works_after_index_loaded() -> None:
     count, clause = lines[-1].split()
     assert int(count) > 0, out
     assert clause == "3.1", out
+
+
+def test_retriever_stems_russian_word_forms() -> None:
+    """«расторжения» и «расторжении» должны находить пункт про расторжение."""
+    out = run_python(
+        "from app.rag import retriever as R\n"
+        "R.load_index_from_disk('../data/index')\n"
+        "res = R.search('условия расторжения договора аренды', 5)\n"
+        "print(' '.join(c['clause'] for c in res))\n"
+    )
+    clauses = out.strip().splitlines()[-1].split()
+    assert any(clause.startswith("6.") for clause in clauses), (
+        f"поиск не нашёл раздел о расторжении: {clauses}"
+    )
+
+
+def test_tokenize_produces_stems() -> None:
+    out = run_python(
+        "from app.rag.retriever import tokenize\n"
+        "print(' '.join(tokenize('расторжения расторжении расторжение')))\n"
+    )
+    tokens = set(out.strip().splitlines()[-1].split())
+    assert len(tokens) == 1, f"формы одного слова не свелись к основе: {tokens}"

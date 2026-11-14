@@ -21,11 +21,17 @@ SYNONYMS = {
     "альфа-трейдинг": "документы_компании__договор_поставки_пт-05-2023_альфа-трейдинг"
 }
 
-def tokenize(text:str) -> list[str]:
-    text = text.lower().replace('ё', 'е')
-    text = re.sub(r'[^а-яa-z0-9\s]', ' ', text)   
-    tokens = [word for word in text.split() if len(word) > 1]
-    return tokens
+def tokenize(text: str) -> list[str]:
+    """Токены для BM25 со стеммингом.
+
+    Без стемминга «расторжения» и «расторжении» для поиска разные слова,
+    и нужный пункт получает score = 0.
+    """
+    from app.rag.normalize import stem
+
+    text = text.lower().replace("ё", "е")
+    text = re.sub(r"[^а-яa-z0-9\s]", " ", text)
+    return [stem(word) for word in text.split() if len(word) > 1]
 
 def build_index(chunks: list[dict]):
     global _bm25_index, _chunks_store
