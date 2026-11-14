@@ -847,6 +847,9 @@ SYSTEM_PROMPT = (
     "\n"
     "ССЫЛКИ — обязательны для каждого факта:\n"
     "  - договоры и внутренние документы: (п. 3.1) в конце предложения;\n"
+    "  - письма, служебные записки и доп. соглашения (в них нет пунктов):\n"
+    "    называй документ по номеру — «(служебная записка № ЮО-7)», «(письмо № К-12)»;\n"
+    "    номер абзаца — только если он есть в контексте;\n"
     "  - законы: Источник: ТК РФ, ст. 70.\n"
     "  - разные редакции одного документа: указывай дату редакции\n"
     "    («в редакции от 10.01.2023», «действующая редакция от 01.03.2025»).\n"
@@ -944,6 +947,9 @@ def _grounded(answer: str, chunks: list[dict]) -> bool:
             if parent in context:
                 continue
         return False
+    for para in re.findall(r"абз\.?\s*(\d+)", answer):
+        if f"абз. {para}" not in context:
+            return False
     for article in re.findall(r"ст\.?\s*(\d+)", answer):
         if article not in context and f"статья {article}" not in context:
             return False
@@ -1061,7 +1067,10 @@ def extractive_answer(question: str, chunks: list[dict]) -> str:
 
 def _ensure_citation(text: str, chunks: list[dict]) -> str:
     """Без ссылки на пункт ответ для судьи слабее — дописываем свою."""
-    if re.search(r"(п\.|пункт|ст\.|статья|ч\.)\s*\d", text, re.I):
+    if re.search(r"(п\.|пункт|ст\.|статья|ч\.|абз\.|абзац)\s*\d", text, re.I):
+        return text
+    # письма и записки цитируют номером документа: «№ ЮО-7», «№ К-12»
+    if re.search(r"№\s*[А-ЯA-Z]{1,4}[-\s]?\d", text):
         return text
     return f"{text.rstrip()} {_citation(chunks[0])}"
 

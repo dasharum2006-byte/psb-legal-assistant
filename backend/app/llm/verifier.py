@@ -1,6 +1,35 @@
+import re
 from typing import Dict, Any, List
 
 from app.rag.normalize import clause_key, clause_keys, keys_match
+
+# слова, которые есть почти в любом заголовке и ничего не различают
+_TITLE_STOPWORDS = {
+    "служебная", "записка", "письмо", "исходящее", "договор", "поставки",
+    "аренды", "нежилого", "помещения", "соглашение", "дополнительное",
+    "общество", "ограниченной", "ответственностью", "между", "номер",
+}
+
+
+def _doc_mentioned(chunk: Dict[str, Any], answer_lower: str) -> bool:
+    """Ответ ссылается на документ, у которого нет пунктов (письмо, записка).
+
+    Полный заголовок в ответе не переписывают — сверяем номер («ЮО-7») и
+    значимые слова названия.
+    """
+    number = str(chunk.get("number") or "").strip()
+    doc = (chunk.get("doc") or "").lower()
+    if not number and doc:
+        found = re.search(r"№\s*([а-яa-z]{1,4}[- ]?\d+(?:[-/]\d+)?)", doc)
+        number = found.group(1) if found else ""
+
+    if number:
+        core = re.escape(number.split("/")[0].strip().lower())
+        if re.search(rf"(?<![\w-]){core}(?![\w-])", answer_lower):
+            return True
+
+    words = [w for w in re.findall(r"[а-яa-z]{5,}", doc) if w not in _TITLE_STOPWORDS]
+    return sum(1 for w in words if w in answer_lower) >= 2
 
 
 class Verifier:
@@ -90,8 +119,7 @@ class Verifier:
                 ):
                     source_matched = True
                     break
-                doc = (chunk.get("doc") or "").lower()
-                if doc and doc in answer_lower:
+                if _doc_mentioned(chunk, answer_lower):
                     source_matched = True
                     break
 

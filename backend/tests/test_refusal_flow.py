@@ -57,3 +57,41 @@ def test_injection_is_still_blocked() -> None:
     result = ask("срок оплаты?", [], Retriever(), client=InjectingClient())
     assert result["refusal"] is True
     assert "90 календарных дней" not in result["answer"]
+
+
+DOCS_WITHOUT_CLAUSES = [
+    {"doc": "СЛУЖЕБНАЯ ЗАПИСКА № ЮО-7 от 12.05.2025", "doc_id": "юо-7",
+     "clause": "абз. 1", "number": "ЮО-7",
+     "text": "Оригиналы договоров выдаются в течение 5 рабочих дней по заявке.", "score": 20.0},
+    {"doc": "Исх. № К-12 от 15.04.2025", "doc_id": "к-12",
+     "clause": "абз. 1", "number": "К-12",
+     "text": "Перед оплатой проводится проверка контрагента по санкционным спискам.", "score": 18.0},
+]
+
+
+def test_letter_cited_by_document_number_is_accepted() -> None:
+    verdict = Verifier.verify(
+        "Перед оплатой проводится проверка контрагента (письмо № К-12).", DOCS_WITHOUT_CLAUSES
+    )
+    assert verdict["ok"] is True, verdict["unsupported"]
+
+
+def test_memo_cited_by_document_name_is_accepted() -> None:
+    verdict = Verifier.verify(
+        "Оригиналы выдаются в течение 5 рабочих дней (Служебная записка № ЮО-7).",
+        DOCS_WITHOUT_CLAUSES,
+    )
+    assert verdict["ok"] is True, verdict["unsupported"]
+
+
+def test_paragraph_reference_matches_абз_clause() -> None:
+    """Ответ с «(абз. 1)» должен подтверждаться чанком с clause = «абз. 1»."""
+    verdict = Verifier.verify("Оригиналы выдаются в течение 5 рабочих дней (абз. 1).", DOCS_WITHOUT_CLAUSES)
+    assert verdict["ok"] is True, verdict["unsupported"]
+
+
+def test_invented_clause_still_rejected() -> None:
+    verdict = Verifier.verify(
+        "Оригиналы выдаются в течение 30 рабочих дней (п. 9.9).", DOCS_WITHOUT_CLAUSES
+    )
+    assert verdict["ok"] is False

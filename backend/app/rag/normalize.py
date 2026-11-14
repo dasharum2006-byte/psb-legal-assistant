@@ -89,6 +89,8 @@ def parse_amounts(text: str) -> list[int]:
 _ARTICLE_RE = re.compile(r"(?:ст\.|стать[яиею])\s*(\d+(?:\.\d+)*)")
 _PART_RE = re.compile(r"(?:ч\.|част(?:ь|и))\s*(\d+)")
 _POINT_RE = re.compile(r"(?:п\.|пункт(?:а|е|ом)?)\s*(\d+(?:\.\d+)*)")
+# письма, записки и доп. соглашения часто не имеют пунктов — только абзацы
+_PARA_RE = re.compile(r"абз(?:ац)?\.?\s*(\d+)")
 
 
 def clause_key(text: str) -> str | None:
@@ -113,6 +115,9 @@ def clause_key(text: str) -> str | None:
     point = _POINT_RE.search(low)
     if point:
         return point.group(1)
+    para = _PARA_RE.search(low)
+    if para:
+        return f"абз.{para.group(1)}"
     if part:
         return f"#{part.group(1)}"
 
@@ -120,6 +125,9 @@ def clause_key(text: str) -> str | None:
     bare = re.fullmatch(r"\s*(\d+(?:\.\d+)*)\s*", low)
     if bare:
         return bare.group(1)
+    bare_para = re.fullmatch(r"\s*абз(?:ац)?\.?\s*(\d+)\s*", low)
+    if bare_para:
+        return f"абз.{bare_para.group(1)}"
     return None
 
 
@@ -130,6 +138,7 @@ def clause_keys(text: str) -> set[str]:
     low = normalize_text(text)
     keys = {match.group(1) for match in _POINT_RE.finditer(low)}
     keys |= {match.group(1) for match in _ARTICLE_RE.finditer(low)}
+    keys |= {f"абз.{match.group(1)}" for match in _PARA_RE.finditer(low)}
     return keys
 
 
