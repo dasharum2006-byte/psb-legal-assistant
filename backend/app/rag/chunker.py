@@ -58,14 +58,35 @@ def _make_chunk(doc: dict, clause: str, text: str, part: str | None = None) -> d
 def _by_clauses(doc: dict) -> list[dict]:
     """Договоры и регламенты: один пункт = один чанк («3.1», «2.4»)."""
     chunks: list[dict] = []
-    pattern = r"(?m)^\s*(\d+\.\d+)[\.\)]\s*"
-    parts = re.split(pattern, doc["text"])
+    text = doc["text"]
+    sections = [
+        (match.start(), f"{match.group(1)}. {match.group(2).strip()}")
+        for match in re.finditer(r"(?m)^\s*(\d+)\.\s+([А-ЯЁ][^\n]{2,60})$", text)
+    ]
 
-    for index in range(1, len(parts), 2):
-        clause = parts[index]
-        body = parts[index + 1] if index + 1 < len(parts) else ""
-        chunk = _make_chunk(doc, clause, body)
+    # многоуровневые пункты (3.1, 3.1.2); если их нет — одноуровневые (1., 2.)
+    matches = list(re.finditer(r"(?m)^\s*(\d+(?:\.\d+)+)[\.\)]?\s+", text))
+    single_level = False
+    if not matches:
+        matches = list(re.finditer(r"(?m)^\s*(\d+)[\.\)]\s+", text))
+        single_level = bool(matches)
+
+    for position, match in enumerate(matches):
+        end = matches[position + 1].start() if position + 1 < len(matches) else len(text)
+        body = text[match.end():end]
+        if len(body.strip()) < (120 if single_level else 30):
+            continue
+
+        section = ""
+        for start, name in sections:
+            if start <= match.start():
+                section = name
+            else:
+                break
+
+        chunk = _make_chunk(doc, match.group(1), body)
         if chunk:
+            chunk["section"] = section
             chunks.append(chunk)
     return chunks
 

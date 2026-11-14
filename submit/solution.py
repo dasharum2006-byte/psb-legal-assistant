@@ -252,6 +252,26 @@ def _revision(filename: str, text: str) -> str | None:
     return active.group(1) if active else None
 
 
+def _document_type(filename: str, text: str) -> str:
+    """Тип документа: законы, договоры, регламенты, письма, записки."""
+    name = filename.lower()
+    head = text[:600].lower()
+
+    if name.startswith("законы__") or "источник:" in head:
+        return "law"
+    if "дополнительное соглашение" in head or "доп соглашение" in name:
+        return "amendment"
+    if "служебная записка" in head or "записка" in name:
+        return "memo"
+    if "письмо" in head or "письмо" in name:
+        return "letter"
+    if "регламент" in head:
+        return "regulation"
+    if "договор" in head:
+        return "contract"
+    return "other"
+
+
 def _is_repealed(text: str) -> bool:
     low = text.lower()
     return "редакция утратила силу" in low or "утратил силу" in low
@@ -290,6 +310,7 @@ def load_documents(path: Path) -> list[dict]:
 
             documents.append({
                 "file": name,
+                "doc_type": _document_type(name, text),
                 "title": title,
                 "number": _numbers(text),
                 "repealed": repealed,
@@ -335,46 +356,80 @@ def _split_long(body: str, limit: int = 1500) -> list[str]:
 
 
 def chunk_documents(documents: list[dict]) -> list[dict]:
+    """Разложить документы на чанки: пункт/статья = один чанк.
+
+    Особенности:
+      - трёхуровневые пункты (3.1.2) остаются отдельными чанками;
+      - одноуровневые пункты (1., 2.) поддерживаются, если в документе
+        нет многоуровневой нумерации;
+      - заголовки разделов («3. Арендная плата») попадают в searchable,
+        иначе поиск не находит пункты по названию темы;
+      - закон режется по статьям, а не по пунктам.
+    """
     chunks: list[dict] = []
 
     def decorate(doc: dict, produced: list[dict]) -> None:
         for item in produced:
             text = item["text"]
+            section = item.get("section", "")
             chunks.append({
                 "doc": doc["title"],
                 "number": doc["number"],
+                "doc_type": doc.get("doc_type"),
                 "clause": item["clause"],
+                "section": section,
                 "text": text,
                 "repealed": doc["repealed"],
-                "searchable": f"{doc['title']} {item['clause']} {text}",
+                # раздел НЕ кладём в searchable: слова вроде «Предмет договора»
+                # есть во всех договорах и только зашумляют поиск
+                "searchable": f"{doc['title']} {item['clause']} {text}".strip(),
             })
 
     for doc in documents:
         text = doc["text"]
+        doc_type = doc.get("doc_type") or "other"
         produced: list[dict] = []
 
-        # трёхуровневые пункты (3.1.1) сохраняем целиком
-        parts = re.split(r"(?m)^\s*(\d+(?:\.\d+)+)[\.\)]\s*", text)
-        for index in range(1, len(parts), 2):
-            body = re.sub(r"\s+", " ", parts[index + 1] if index + 1 < len(parts) else "").strip()
-            if len(body) >= 30:
-                produced.append({"clause": parts[index], "text": body})
+        # --- законы: только по статьям ---
+        if doc_type == "law":
+            # в выгрузках гаранта строка начинается с «Источник: Статья 70. …»
+            parts = re.split(r"(?m)^\s*(?:Источник:\s*)?(Статья\s+\d+(?:\.\d+)?)", text)
+            for index in range(1, len(parts), 2):
+                clause = parts[index].strip().replace("Статья", "ст.")
+                body = parts[index + 1] if index + 1 < len(parts) else ""
+                for piece in _split_long(body):
+                    produced.append({"clause": clause, "text": piece})
+            if produced:
+                decorate(doc, produced)
+                continue
+            # статья не нашлась — падаем в абзацы, но документ не теряем
+
+        # --- договоры и регламенты: по пунктам ---
+        sections = _section_map(text)
+        matches = list(re.finditer(r"(?m)^\s*(\d+(?:\.\d+)+)[\.\)]?\s+", text))
+        single_level = False
+        if not matches:
+            # нет многоуровневой нумерации — пробуем одноуровневую (1., 2.)
+            matches = list(re.finditer(r"(?m)^\s*(\d+)[\.\)]\s+", text))
+            single_level = bool(matches)
+
+        for position, match in enumerate(matches):
+            end = matches[position + 1].start() if position + 1 < len(matches) else len(text)
+            body = re.sub(r"\s+", " ", text[match.end():end]).strip()
+            # у одноуровневых пунктов тело заголовка короткое — такие не берём
+            if len(body) < (60 if single_level else 30):
+                continue
+            produced.append({
+                "clause": match.group(1),
+                "text": body,
+                "section": _section_at(sections, match.start()),
+            })
 
         if produced:
             decorate(doc, produced)
             continue
 
-        parts = re.split(r"(?m)^\s*(Статья\s+\d+(?:\.\d+)?)", text)
-        for index in range(1, len(parts), 2):
-            clause = parts[index].strip().replace("Статья", "ст.")
-            body = parts[index + 1] if index + 1 < len(parts) else ""
-            for piece in _split_long(body):
-                produced.append({"clause": clause, "text": piece})
-
-        if produced:
-            decorate(doc, produced)
-            continue
-
+        # --- письма, записки, соглашения и всё остальное: по абзацам ---
         number = 0
         for block in re.split(r"\n\s*\n", text):
             block = re.sub(r"\s+", " ", block).strip()
@@ -387,6 +442,25 @@ def chunk_documents(documents: list[dict]) -> list[dict]:
         decorate(doc, produced)
 
     return chunks
+
+
+def _section_map(text: str) -> list[tuple[int, str]]:
+    """Позиции и названия разделов вида «3. Арендная плата»."""
+    return [
+        (match.start(), f"{match.group(1)}. {match.group(2).strip()}")
+        for match in re.finditer(r"(?m)^\s*(\d+)\.\s+([А-ЯЁ][^\n]{2,60})$", text)
+    ]
+
+
+def _section_at(sections: list[tuple[int, str]], position: int) -> str:
+    """Раздел, в котором находится пункт."""
+    current = ""
+    for start, name in sections:
+        if start <= position:
+            current = name
+        else:
+            break
+    return current
 
 
 # ─────────────────────── поиск ───────────────────────
@@ -890,9 +964,11 @@ def ask_llm(client: httpx.Client, question: str, chunks: list[dict]) -> str | No
 
 
 def _pick_sentences(chunk: dict, wanted: set[str], limit: int = 320) -> str:
-    sentences = [s.strip() for s in re.split(r"(?<=[.;])\s+", chunk["text"]) if s.strip()]
+    raw_sentences = [s.strip() for s in re.split(r"(?<=[.;])\s+", chunk["text"]) if s.strip()]
+    # «Химки, ул.» — это не предложение, а обрывок из-за сокращений «г.», «ул.»
+    sentences = [s for s in raw_sentences if len(s) >= 40]
     if not sentences:
-        return ""
+        return chunk["text"][:limit].strip()
 
     blacklist = (
         "реквизиты", "инн", "кпп", "расчетный счет", "расчётный счет",
@@ -928,7 +1004,10 @@ def extractive_answer(question: str, chunks: list[dict]) -> str:
     wanted = significant_tokens(question)
     parts = []
     for chunk in chunks[:2]:
-        text = _pick_sentences(chunk, wanted)
+        if len(chunk["text"]) <= 320:
+            text = chunk["text"].strip()      # короткий пункт — весь является ответом
+        else:
+            text = _pick_sentences(chunk, wanted)
         if text:
             parts.append(f"{text} {_citation(chunk)}")
     return " ".join(parts) if parts else REFUSAL
