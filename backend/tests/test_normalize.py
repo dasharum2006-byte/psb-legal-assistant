@@ -77,3 +77,25 @@ def test_percents_years_and_articles_are_not_amounts() -> None:
     assert parse_amounts("0,1% от суммы") == []
     assert parse_amounts("в августе 2024 года") == []
     assert parse_amounts("ст. 13.11 КоАП") == []
+
+
+def test_billions_are_parsed() -> None:
+    """«2 млрд» — это два миллиарда, а не 2 рубля."""
+    assert parse_amounts("2 млрд") == [2_000_000_000]
+    assert parse_amounts("3 миллиарда рублей") == [3_000_000_000]
+    assert parse_amounts("1,5 млрд") == [1_500_000_000]
+    assert parse_amounts("2 миллиардами рублей") == [2_000_000_000]
+
+
+def test_abbreviated_thousands() -> None:
+    """«т.р.» и «т. руб.» — тоже тысячи."""
+    assert parse_amounts("100 т.р.") == [100_000]
+    assert parse_amounts("100 т. руб.") == [100_000]
+    assert parse_amounts("100 т.руб.") == [100_000]
+    assert parse_amounts("100т.р.") == [100_000]
+
+
+def test_thousands_words() -> None:
+    assert parse_amounts("500 тысяч рублей") == [500_000]
+    assert parse_amounts("500 тыс. руб.") == [500_000]
+    assert parse_amounts("250 тыс") == [250_000]

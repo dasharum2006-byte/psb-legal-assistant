@@ -11,8 +11,12 @@ _AMOUNT = re.compile(
     # на число 1 и дробь .500 и сумма терялась
     r"(?<![\w.,/])(?P<number>\d{1,3}(?:[ .]\d{3})+|\d+)"
     r"(?P<fraction>[.,]\d{1,2})?(?!\d)"
-    r"(?:\s*(?P<unit>млн|миллион(?:а|ов)?|тыс(?:яч(?:а|и)?)?|"
-    r"руб(?:ль|ля|лей)?|р\.|₽)(?!\w))?"
+    r"(?:\s*(?P<unit>"
+    r"млрд|миллиард(?:а|ов|ами)?|"          # миллиарды
+    r"млн|миллион(?:а|ов|ами)?|"            # миллионы
+    r"тыс(?:яч(?:а|и|ами)?)?|т\.\s?(?:р|руб)\.?|"   # тысячи и «т.р.»
+    r"руб(?:ль|ля|лей|лями)?|р\.|₽"         # рубли
+    r")(?!\w))?"
     r"(?P<percent>\.?\s*(?:%|процент(?:а|ов)?\b))?"
 )
 _NUMBER = r"\d+(?:\.\d+)*"
@@ -43,9 +47,11 @@ def parse_amounts(text: str) -> list[int]:
             continue
 
         multiplier = 1
-        if unit == "млн" or unit.startswith("миллион"):
+        if unit.startswith(("млрд", "миллиард")):
+            multiplier = 1_000_000_000
+        elif unit.startswith(("млн", "миллион")):
             multiplier = 1_000_000
-        elif unit.startswith("тыс"):
+        elif unit.startswith(("тыс", "т.р", "т. р")):
             multiplier = 1_000
 
         fraction = (match["fraction"] or "")[1:]
