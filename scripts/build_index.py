@@ -6,11 +6,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Добавляем путь к корню проекта, чтобы работали импорты из backend
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'backend')))
 
-from backend.app.rag.parser import load_documents
-from backend.app.rag.chunker import chunk_documents
-from backend.app.rag.retriever import build_index
+from app.rag.parser import load_documents
+from app.rag.chunker import chunk_documents
+from app.rag.retriever import build_index
 
 def main(kb_path):
     print(f"1. Читаем документы из {kb_path}...")

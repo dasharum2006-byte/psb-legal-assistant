@@ -72,7 +72,16 @@ def contextual_query(question: str, history: list[dict] | None) -> str:
     if not history:
         return question
 
-    previous = [m.get("text", "") for m in history if m.get("role") == "user" and m.get("text")]
+    # история приходит в двух форматах: {"role","content"} (API, OpenAI-стиль)
+    # и {"role","text"} (внутренний). Раньше читался только "text", поэтому
+    # уточняющие вопросы из API теряли контекст и искали не то.
+    def _message_text(message: dict) -> str:
+        return str(message.get("text") or message.get("content") or "").strip()
+
+    previous = [
+        _message_text(m) for m in history
+        if m.get("role") == "user" and _message_text(m)
+    ]
     if not previous:
         return question
 

@@ -8,6 +8,11 @@ TODO:
 """
 from rank_bm25 import BM25Okapi
 import re
+
+try:  # запуск из backend/ (uvicorn, pytest)
+    from app.rag.normalize import stem
+except ModuleNotFoundError:  # запуск из корня репозитория (scripts/build_index.py)
+    from backend.app.rag.normalize import stem
 import os
 import json
 
@@ -21,8 +26,6 @@ def tokenize(text: str) -> list[str]:
     Без стемминга «расторжения» и «расторжении» для поиска разные слова,
     и нужный пункт получает score = 0.
     """
-    from app.rag.normalize import stem
-
     text = text.lower().replace("ё", "е")
     text = re.sub(r"[^а-яa-z0-9\s]", " ", text)
     return [stem(word) for word in text.split() if len(word) > 1]
