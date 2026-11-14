@@ -22,6 +22,18 @@ MIN_SCORE = float(os.getenv("MIN_SCORE", "8"))
 # если нужный документ оказался на 9-15 месте. Поэтому берём с запасом.
 SEARCH_CANDIDATES = int(os.getenv("SEARCH_CANDIDATES", "40"))
 
+# Порог отсечения зависит от шкалы очков поиска:
+#   BM25           — десятки (10..100)  -> MIN_SCORE (по умолчанию 8)
+#   косинус / RRF  — 0..1              -> MIN_SCORE_NORMALIZED (по умолчанию 0.25)
+# Жёсткий порог 8 на шкале 0..1 выбросил бы ВСЕ чанки и мы бы всегда отказывали.
+MIN_SCORE_NORMALIZED = float(os.getenv("MIN_SCORE_NORMALIZED", "0.25"))
+
+
+def score_threshold(scores: list[float]) -> float:
+    """Порог, соответствующий шкале, в которой пришёл поиск."""
+    top = max(scores, default=0.0)
+    return MIN_SCORE_NORMALIZED if top <= 1.5 else MIN_SCORE
+
 # Доменные подсказки: слова из вопроса -> слова из документов.
 # Нужны, потому что люди говорят «платить», а в договоре «арендная плата».
 SYNONYMS = {
@@ -320,8 +332,9 @@ def ask(
 
     chunks = _post_filter([_adapt(chunk) for chunk in raw], analysis, filters)
 
-    # 2. порог: всё слабее MIN_SCORE — считаем, что не нашли
-    chunks = [chunk for chunk in chunks if chunk["score"] >= MIN_SCORE]
+    # 2. порог: шкала определяется по максимальному очку
+    threshold = score_threshold([chunk["score"] for chunk in chunks])
+    chunks = [chunk for chunk in chunks if chunk["score"] >= threshold]
     if not chunks:
         return _refusal("no_chunks")
 

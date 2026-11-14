@@ -115,3 +115,36 @@ def test_filter_finds_document_beyond_first_eight() -> None:
                  filters={"doc_type": ["regulation"]})
     assert result["refusal"] is False, "верный документ был на 15-м месте и не нашёлся"
     assert result["sources"][0]["doc"] == "РЕГЛАМЕНТ (ред. 2025)"
+
+
+class CosineRetriever:
+    """Гибрид/эмбеддинги: очки в шкале 0..1 (как косинус или RRF)."""
+
+    def __init__(self, scores):
+        self.scores = scores
+
+    def search(self, query, k=40, filters=None):
+        return [{
+            "doc_id": "doc", "doc": "ДОГОВОР АРЕНДЫ № А-08/2024", "doc_type": "contract",
+            "clause": "3.1", "text": "Арендная плата 450 000 рублей.",
+            "score": score, "status": "active",
+        } for score in self.scores]
+
+
+def test_cosine_scale_scores_are_not_rejected() -> None:
+    """Порог 8 на шкале 0..1 выбрасывал бы все чанки и давал вечный отказ."""
+    result = ask("какая арендная плата?", [], CosineRetriever([0.82, 0.71, 0.55]),
+                 client=FakeClient(), filters={})
+    assert result["refusal"] is False, "очки 0..1 не должны отсекаться порогом 8"
+
+
+def test_low_cosine_scores_still_refuse() -> None:
+    """Если по смыслу ничего не подошло — отказ остаётся отказом."""
+    result = ask("какой размер пособия?", [], CosineRetriever([0.10, 0.08]),
+                 client=FakeClient(), filters={})
+    assert result["refusal"] is True
+
+
+def test_bm25_scale_still_uses_absolute_threshold() -> None:
+    result = ask("вопрос", [], CosineRetriever([40.0, 22.0]), client=FakeClient(), filters={})
+    assert result["refusal"] is False
