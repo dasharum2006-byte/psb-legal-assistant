@@ -9,12 +9,15 @@ TODO:
 
 import re
 import calendar
+import logging
 import os
 
 # Порог отсечения: если лучший результат поиска слабее — считаем, что
 # ничего не нашли, и отказываем вместо ответа по мусору.
 # 12 — для BM25 (нормальные вопросы дают 60-112, мусорные 4-7).
 # Если переключимся на гибрид с очками 0..1 — поставить 0.25.
+logger = logging.getLogger(__name__)
+
 MIN_SCORE = float(os.getenv("MIN_SCORE", "8"))
 
 # Сколько кандидатов забирать из поиска ДО фильтров. Фильтры (doc_ids,
@@ -363,7 +366,8 @@ def ask(
     # 1. поиск
     try:
         raw = retriever.search(analysis["search_query"], SEARCH_CANDIDATES)
-    except Exception:
+    except Exception as exc:
+        logger.exception("RETRIEVER_FAILED: %s: %s", type(exc).__name__, exc)
         return _refusal("llm_unavailable")
 
     chunks = _post_filter([_adapt(chunk) for chunk in raw], analysis, filters)
@@ -382,8 +386,15 @@ def ask(
     # 4. генерация
     client = client or LLMClient()
     try:
-        answer = client.generate(build_rag_prompt(question, picked, history))
-    except Exception:
+        prompt = build_rag_prompt(question, picked, history)
+        answer = client.generate(prompt)
+    except TypeError as exc:
+        # несовпадение сигнатур (например, промпт перестал принимать history)
+        # — это ошибка кода, её надо видеть, а не маскировать отказом
+        logger.exception("PROMPT_SIGNATURE_ERROR: %s", exc)
+        return _refusal("llm_unavailable")
+    except Exception as exc:
+        logger.exception("LLM_CALL_FAILED: %s: %s", type(exc).__name__, exc)
         return _refusal("llm_unavailable")
 
     # 5. проверка ответа
