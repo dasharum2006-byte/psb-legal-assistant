@@ -480,10 +480,20 @@ def _strip_headings(body: str) -> str:
 
 def _section_map(text: str) -> list[tuple[str, str]]:
     """Позиции и названия разделов вида «3. Арендная плата»."""
-    return [
+    found = [
         (match.start(), f"{match.group(1)}. {match.group(2).strip()}")
         for match in re.finditer(r"(?m)^\s*(\d+)\.\s+([А-ЯЁ][^\n]{2,60})$", text)
     ]
+    # крупные заголовки законов: «Глава 21», «Раздел VII», «§ 3».
+    # В демо-базе их нет, но в приватной могут быть кодифицированные акты.
+    found += [
+        (match.start(), match.group(0).strip())
+        for match in re.finditer(
+            r"(?m)^\s*(?:Глава|ГЛАВА|Раздел|РАЗДЕЛ|§)\s+[\dIVXLС]+[^\n]{0,60}$", text
+        )
+    ]
+    found.sort()
+    return found
 
 
 def _section_at(sections: list[tuple[int, str]], position: int) -> str:

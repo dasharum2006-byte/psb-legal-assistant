@@ -87,6 +87,16 @@ def _by_clauses(doc: dict) -> list[dict]:
         (match.start(), f"{match.group(1)}. {match.group(2).strip()}")
         for match in re.finditer(r"(?m)^\s*(\d+)\.\s+([А-ЯЁ][^\n]{2,60})$", text)
     ]
+    # крупные заголовки законов: «Глава 21», «Раздел VII», «§ 3».
+    # В нашей базе их нет, но приватный набор может содержать кодифицированные
+    # акты — без этого название главы не попадёт в поисковый текст чанка.
+    sections += [
+        (match.start(), match.group(0).strip())
+        for match in re.finditer(
+            r"(?m)^\s*(?:Глава|ГЛАВА|Раздел|РАЗДЕЛ|§)\s+[\dIVXLС]+[^\n]{0,60}$", text
+        )
+    ]
+    sections.sort()
 
     # многоуровневые пункты (3.1, 3.1.2); если их нет — одноуровневые (1., 2.)
     matches = list(re.finditer(r"(?m)^\s*(\d+(?:\.\d+)+)[\.\)]?\s+", text))
