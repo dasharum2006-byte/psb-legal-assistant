@@ -9,9 +9,12 @@
 from __future__ import annotations
 
 import os
+import io
+import xml.etree.ElementTree as ET
 import logging
 import re
 import zipfile
+from pathlib import Path
 
 MONTHS = {
     "января": 1, "январь": 1, "январе": 1,
@@ -134,6 +137,28 @@ logger = logging.getLogger(__name__)
 JUNK_NAMES = ("thumbs.db", ".ds_store", "desktop.ini")
 
 
+def read_docx(raw: bytes) -> str:
+    """DOCX = zip с XML; обходимся без внешних библиотек."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as doc:
+        xml = doc.read("word/document.xml")
+    root = ET.fromstring(xml)
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    return "\n".join(
+        "".join(node.text or "" for node in paragraph.iter(ns + "t"))
+        for paragraph in root.iter(ns + "p")
+    )
+
+
+def _decode(name: str, raw: bytes) -> str:
+    """Декодировать файл базы: DOCX через XML, остальное как текст."""
+    if name.lower().endswith(".docx"):
+        return read_docx(raw)
+    return raw.decode("utf-8-sig", errors="replace")
+
+
+SUPPORTED_SUFFIXES = {".txt", ".md", ".docx"}
+
+
 def _is_junk(name: str) -> bool:
     """Служебные файлы архивов: macOS, Windows, скрытые."""
     base = name.rsplit("/", 1)[-1]
@@ -154,12 +179,16 @@ def _doc_id(filename: str) -> str:
 
 def load_documents(kb_path: str) -> list[dict]:
     """Прочитать документы из zip (или папки) с метаданными."""
+    kb_path = str(kb_path)
     documents: list[dict] = []
 
     def read_one(filename: str, raw: bytes) -> None:
         """Разбор одного файла: битый файл не должен ронять всю загрузку."""
         try:
-            text = raw.decode("utf-8-sig", errors="replace")
+            text = _decode(filename, raw)
+            if not text.strip():
+                logger.warning("PARSER_EMPTY_FILE: %s", filename)
+                return
             documents.append(_make_document(filename, text))
         except Exception as exc:  # повреждённый файл, битая кодировка и т.п.
             logger.warning("PARSER_SKIP_FILE: %s: %s: %s", filename, type(exc).__name__, exc)
@@ -167,7 +196,7 @@ def load_documents(kb_path: str) -> list[dict]:
     if kb_path.endswith(".zip"):
         with zipfile.ZipFile(kb_path, "r") as archive:
             for filename in archive.namelist():
-                if not filename.endswith(".txt") or _is_junk(filename):
+                if Path(filename).suffix.lower() not in SUPPORTED_SUFFIXES or _is_junk(filename):
                     continue
                 try:
                     with archive.open(filename) as handle:
@@ -178,7 +207,7 @@ def load_documents(kb_path: str) -> list[dict]:
                 read_one(filename, raw)
     else:
         for name in sorted(os.listdir(kb_path)):
-            if not name.endswith(".txt") or _is_junk(name):
+            if Path(name).suffix.lower() not in SUPPORTED_SUFFIXES or _is_junk(name):
                 continue
             try:
                 with open(os.path.join(kb_path, name), "rb") as handle:
@@ -234,6 +263,9 @@ def _make_document(filename: str, text: str) -> dict:
         "valid_from": valid_from,
         "valid_to": valid_to,
         "source_path": filename,
+        # поля, которые нужны конвейеру сабмита
+        "file": filename,
+        "repealed": status == "repealed",
         "text": text,
     }
 

@@ -360,7 +360,8 @@ def _refusal(reason: str, missing: list[str] | None = None) -> dict:
     }
 
 
-def pick_sources(answer: str, chunks: list[dict], limit: int = 3) -> list[dict]:
+def pick_sources(answer: str, chunks: list[dict], limit: int = 3,
+                 question: str = "") -> list[dict]:
     """Оставить только те источники, на которые ответ реально ссылается.
 
     Сравниваем по каноническим ключам ссылок: «статья 15», «ст.15» и
@@ -375,12 +376,15 @@ def pick_sources(answer: str, chunks: list[dict], limit: int = 3) -> list[dict]:
         if chunk.get("clause")
         and any(keys_match(key, clause_key(chunk["clause"]) or "") for key in answer_keys)
     ]
+    from app.rag.textsel import pick_snippet
+
     chosen = (cited or chunks)[:limit]
     return [
         {
             "doc": chunk["doc"],
             "clause": chunk["clause"],
-            "text": chunk["text"][:300],
+            # на вопрос о сумме в сниппете должна быть сумма, а не дата платежа
+            "text": pick_snippet(chunk, question or ""),
             "score": chunk["score"],
         }
         for chunk in chosen
@@ -476,7 +480,7 @@ def ask(
     # 6. ответ
     return {
         "answer": answer.strip(),
-        "sources": pick_sources(answer, picked),
+        "sources": pick_sources(answer, picked, question=question),
         "refusal": False,
         "missing_info": [],
     }

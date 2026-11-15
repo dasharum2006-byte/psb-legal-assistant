@@ -208,60 +208,52 @@ def significant_tokens(text: str) -> set[str]:
 
 # ─────────────────────── документы ───────────────────────
 
-def read_docx(raw: bytes) -> str:
-    """DOCX = zip с XML; обходимся без внешних библиотек."""
-    with zipfile.ZipFile(io.BytesIO(raw)) as doc:
-        xml = doc.read("word/document.xml")
-    root = ET.fromstring(xml)
-    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    return "\n".join(
-        "".join(node.text or "" for node in paragraph.iter(ns + "t"))
-        for paragraph in root.iter(ns + "p")
-    )
+# >>> GENERATED:parser
+import os
+import io
+import xml.etree.ElementTree as ET
+import logging
+import re
+import zipfile
+from pathlib import Path
+
+MONTHS = {
+    "января": 1, "январь": 1, "январе": 1,
+    "февраля": 2, "февраль": 2, "феврале": 2,
+    "марта": 3, "март": 3, "марте": 3,
+    "апреля": 4, "апрель": 4, "апреле": 4,
+    "мая": 5, "май": 5, "мае": 5,
+    "июня": 6, "июнь": 6, "июне": 6,
+    "июля": 7, "июль": 7, "июле": 7,
+    "августа": 8, "август": 8, "августе": 8,
+    "сентября": 9, "сентябрь": 9, "сентябре": 9,
+    "октября": 10, "октябрь": 10, "октябре": 10,
+    "ноября": 11, "ноябрь": 11, "ноябре": 11,
+    "декабря": 12, "декабрь": 12, "декабре": 12,
+}
 
 
-def find_kb() -> Path:
-    candidates = ("kb.zip", "knowledge-base.zip", "knowledge_base.zip")
-    for root in (DATA_DIR, Path.cwd()):
-        for name in candidates:
-            path = root / name
-            if path.is_file():
-                return path
-        for path in sorted(root.glob("*.zip")):
-            return path
-    raise SystemExit(f"не найден архив базы знаний в {DATA_DIR}")
+def _first_date(text: str) -> str | None:
+    """Первая дата в тексте -> ISO. Поддерживает 12.02.2024 и 12 февраля 2024."""
+    low = text.lower().replace("ё", "е")
 
+    exact = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b", low)
+    if exact:
+        day, month, year = (int(part) for part in exact.groups())
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return f"{year:04d}-{month:02d}-{day:02d}"
 
-def _title(text: str, filename: str) -> str:
-    lines = [line.strip() for line in text.splitlines()[:15] if line.strip()]
-    for line in lines:
-        if re.match(r"^Статья\s+\d+", line):
-            return line
-    for line in lines:
-        if line.lower().startswith("источник:"):
-            return line.split(":", 1)[1].strip()
-    for line in lines:
-        low = line.lower()
-        if low.startswith(("редакция утратила", "в связи с")):
-            continue
-        if re.search(r"договор|регламент|письмо|записка|соглашение|исх\. №", low):
-            return line
-    for line in lines:
-        if not line.lower().startswith(("редакция утратила", "url:", "дата выгрузки")):
-            return line
-    return Path(filename).stem
-
-
-def _revision(filename: str, text: str) -> str | None:
-    match = re.search(r"ред[^0-9]{0,3}(20\d{2})", filename.lower())
-    if match:
-        return match.group(1)
-    active = re.search(r"действует с \d{2}\.\d{2}\.(20\d{2})", text.lower())
-    return active.group(1) if active else None
+    words = re.search(r"\b(\d{1,2})\s+([а-я]+)\s+(20\d{2})", low)
+    if words and words.group(2) in MONTHS:
+        day = int(words.group(1))
+        month = MONTHS[words.group(2)]
+        year = int(words.group(3))
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    return None
 
 
 def _document_type(filename: str, text: str) -> str:
-    """Тип документа: законы, договоры, регламенты, письма, записки."""
+    """Тип документа: сначала по папке в имени файла, потом по заголовку."""
     name = filename.lower()
     head = text[:600].lower()
 
@@ -280,60 +272,230 @@ def _document_type(filename: str, text: str) -> str:
     return "other"
 
 
-def _is_repealed(text: str) -> bool:
-    low = text.lower()
-    return "редакция утратила силу" in low or "утратил силу" in low
+def _validity(text: str) -> tuple[str | None, str | None, str]:
+    """Период действия редакции и статус.
+
+    Возвращает (valid_from, valid_to, status).
+    """
+    low = text.lower().replace("ё", "е")
+    valid_from = valid_to = None
+
+    repealed = re.search(r"редакция утратила силу с (\d{2})\.(\d{2})\.(\d{4})", low)
+    if repealed:
+        valid_to = f"{repealed.group(3)}-{repealed.group(2)}-{repealed.group(1)}"
+
+    active_since = re.search(r"действует с (\d{2})\.(\d{2})\.(\d{4})", low)
+    if active_since:
+        valid_from = f"{active_since.group(3)}-{active_since.group(2)}-{active_since.group(1)}"
+
+    # Сама фраза «редакция утратила силу с <дата>» уже означает отмену.
+    # Раньше условие требовало отсутствия valid_from: если в шапке были обе
+    # фразы («действует с 2023» и «утратила силу с 2025»), документ
+    # ошибочно получал status="active".
+    status = "repealed" if valid_to else "active"
+    return valid_from, valid_to, status
 
 
-def _numbers(text: str) -> str | None:
-    match = re.search(r"№\s*([А-ЯA-Z0-9][А-ЯA-Z0-9./\-]*)", text[:500])
+def _title(text: str) -> str:
+    """Заголовок: ищем строку с названием документа, а не шапку про отмену."""
+    lines = [line.strip() for line in text.splitlines()[:15] if line.strip()]
+
+    # 1) закон: строка вида "Статья 70. Испытание при приёме на работу"
+    for line in lines:
+        if re.match(r"^Статья\s+\d+(?:\.\d+)?\s*\.", line):
+            return line
+
+    # 2) шапка гаранта: "Источник: Статья 70. Испытание при приёме на работу..."
+    for line in lines:
+        if line.lower().startswith("источник:"):
+            return line.split(":", 1)[1].strip()
+
+    # 3) документ: строка с ключевым словом типа
+    keywords = ("договор", "регламент", "письмо", "записка", "соглашение", "исх. №")
+    for line in lines:
+        low = line.lower()
+        if low.startswith(("редакция утратила", "в связи с")):
+            continue
+        if any(word in low for word in keywords):
+            return line
+
+    # 4) иначе первая не-шапка
+    for line in lines:
+        low = line.lower()
+        if not low.startswith(("редакция утратила", "url:", "дата выгрузки")):
+            return line
+
+    return lines[0] if lines else ""
+
+
+def _number(title: str) -> str | None:
+    match = re.search(r"№\s*([А-ЯA-Z0-9][А-ЯA-Z0-9./\-]*)", title)
     return match.group(1).rstrip(".") if match else None
 
 
-def load_documents(path: Path) -> list[dict]:
+logger = logging.getLogger(__name__)
+
+JUNK_NAMES = ("thumbs.db", ".ds_store", "desktop.ini")
+
+
+def read_docx(raw: bytes) -> str:
+    """DOCX = zip с XML; обходимся без внешних библиотек."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as doc:
+        xml = doc.read("word/document.xml")
+    root = ET.fromstring(xml)
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    return "\n".join(
+        "".join(node.text or "" for node in paragraph.iter(ns + "t"))
+        for paragraph in root.iter(ns + "p")
+    )
+
+
+def _decode(name: str, raw: bytes) -> str:
+    """Декодировать файл базы: DOCX через XML, остальное как текст."""
+    if name.lower().endswith(".docx"):
+        return read_docx(raw)
+    return raw.decode("utf-8-sig", errors="replace")
+
+
+SUPPORTED_SUFFIXES = {".txt", ".md", ".docx"}
+
+
+def _is_junk(name: str) -> bool:
+    """Служебные файлы архивов: macOS, Windows, скрытые."""
+    base = name.rsplit("/", 1)[-1]
+    return (
+        name.startswith("__MACOSX/")
+        or base.startswith("._")
+        or base.startswith(".")
+        or base.lower() in JUNK_NAMES
+    )
+
+
+def _doc_id(filename: str) -> str:
+    """Идентификатор документа: без путей и пробелов."""
+    stem = filename.replace(".txt", "").replace("\\", "/")
+    stem = stem.rsplit("/", 1)[-1]                 # отбрасываем папки внутри архива
+    return stem.replace(" ", "_").lower()
+
+
+def load_documents(kb_path: str) -> list[dict]:
+    """Прочитать документы из zip (или папки) с метаданными."""
+    kb_path = str(kb_path)
     documents: list[dict] = []
-    with zipfile.ZipFile(path) as archive:
-        for name in sorted(archive.namelist()):
-            if name.endswith("/") or name.startswith("__MACOSX/"):
-                continue
-            suffix = Path(name).suffix.lower()
-            if suffix not in {".txt", ".md", ".docx"}:
-                continue
-            # служебные файлы архивов macOS/Windows
-            base = name.rsplit("/", 1)[-1]
-            if (name.startswith("__MACOSX/") or base.startswith((".", "._"))
-                    or base.lower() in ("thumbs.db", "desktop.ini")):
-                continue
-            raw = archive.read(name)
-            try:
-                text = read_docx(raw) if suffix == ".docx" else raw.decode("utf-8-sig", errors="replace")
-            except Exception as exc:
-                print(f"пропущен нечитаемый документ {name}: {type(exc).__name__}", file=sys.stderr)
-                continue
+
+    def read_one(filename: str, raw: bytes) -> None:
+        """Разбор одного файла: битый файл не должен ронять всю загрузку."""
+        try:
+            text = _decode(filename, raw)
             if not text.strip():
+                logger.warning("PARSER_EMPTY_FILE: %s", filename)
+                return
+            documents.append(_make_document(filename, text))
+        except Exception as exc:  # повреждённый файл, битая кодировка и т.п.
+            logger.warning("PARSER_SKIP_FILE: %s: %s: %s", filename, type(exc).__name__, exc)
+
+    if kb_path.endswith(".zip"):
+        with zipfile.ZipFile(kb_path, "r") as archive:
+            for filename in archive.namelist():
+                if Path(filename).suffix.lower() not in SUPPORTED_SUFFIXES or _is_junk(filename):
+                    continue
+                try:
+                    with archive.open(filename) as handle:
+                        raw = handle.read()
+                except Exception as exc:
+                    logger.warning("PARSER_READ_FAILED: %s: %s", filename, exc)
+                    continue
+                read_one(filename, raw)
+    else:
+        for name in sorted(os.listdir(kb_path)):
+            if Path(name).suffix.lower() not in SUPPORTED_SUFFIXES or _is_junk(name):
                 continue
+            try:
+                with open(os.path.join(kb_path, name), "rb") as handle:
+                    raw = handle.read()
+            except OSError as exc:
+                logger.warning("PARSER_READ_FAILED: %s: %s", name, exc)
+                continue
+            read_one(name, raw)
 
-            title = _title(text, name)
-            revision = _revision(name, text)
-            repealed = _is_repealed(text)
-            if revision and "ред." not in title.lower():
-                title = f"{title} (ред. {revision})"
-            if repealed:
-                title = f"{title} — УТРАТИЛА СИЛУ"
-
-            documents.append({
-                "file": name,
-                "doc_type": _document_type(name, text),
-                "title": title,
-                "number": _numbers(text),
-                "repealed": repealed,
-                "text": text,
-            })
     if not documents:
-        # Библиотека не падает: пустой список обрабатывается выше — ответы
-        # станут отказами, но валидный submission.csv будет создан.
-        print("в архиве нет читаемых документов", file=sys.stderr)
+        logger.warning("PARSER_EMPTY: в %s нет читаемых документов", kb_path)
     return documents
+
+
+def _revision(filename: str, text: str, valid_from: str | None, valid_to: str | None) -> str | None:
+    """Год редакции.
+
+    Порядок: год из имени файла («ред 2023») -> год начала действия.
+    Год окончания действия НЕ подходит: у редакции 2023 он равен 2025,
+    и обе редакции получили бы одинаковый год.
+    """
+    name = filename.lower()
+    found = re.search(r"ред[^0-9]{0,3}(20\d{2})", name)
+    if found:
+        return found.group(1)
+    found = re.search(r"(20\d{2})", name)
+    if found:
+        return found.group(1)
+    if valid_from:
+        return valid_from[:4]
+    found = re.search(r"редакция от \d{2}\.\d{2}\.(20\d{2})", text.lower())
+    return found.group(1) if found else None
+
+
+def _make_document(filename: str, text: str) -> dict:
+    valid_from, valid_to, status = _validity(text)
+    revision = _revision(filename, text, valid_from, valid_to)
+
+    title = _title(text)
+    doc_type = _document_type(filename, text)
+    # у двух редакций одного регламента заголовок одинаковый — различаем годом
+    if doc_type == "regulation" and revision and "(ред." not in title.lower():
+        title = f"{title} (ред. {revision})"
+
+    return {
+        "doc_id": _doc_id(filename),
+        "title": title,
+        "doc_type": doc_type,
+        "number": _number(title),
+        "date": _first_date(text),
+        "revision": revision,
+        "status": status,
+        "valid_from": valid_from,
+        "valid_to": valid_to,
+        "source_path": filename,
+        # поля, которые нужны конвейеру сабмита
+        "file": filename,
+        "repealed": status == "repealed",
+        "text": text,
+    }
+# <<< GENERATED:parser
+
+
+
+
+def find_kb() -> Path:
+    candidates = ("kb.zip", "knowledge-base.zip", "knowledge_base.zip")
+    for root in (DATA_DIR, Path.cwd()):
+        for name in candidates:
+            path = root / name
+            if path.is_file():
+                return path
+        for path in sorted(root.glob("*.zip")):
+            return path
+    raise SystemExit(f"не найден архив базы знаний в {DATA_DIR}")
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _split_sentences(block: str, limit: int = 450) -> list[str]:
@@ -1112,13 +1274,16 @@ def ask_llm(
     return None
 
 
+# >>> GENERATED:textsel
+import re
+
+# вопрос про конкретное значение: сумму, срок, процент
 VALUE_MARKERS = (
     "сколько", "какая", "какой", "какое", "какие", "размер", "сумма", "сумму",
     "стоимость", "цена", "процент", "ставка", "тариф", "штраф", "пеня",
     "неустойка", "плата", "срок", "когда",
 )
-# вопросы про время: значение важнее, но порядок не переставляем —
-# на «когда вносится плата» ответ должен начинаться со срока, а не с суммы
+# вопрос про время: значение важно, но порядок не переставляем
 TIMING_MARKERS = ("когда", "в какой срок", "как часто", "с какого", "до какого", "какого числа")
 
 
@@ -1127,9 +1292,9 @@ def has_amount(text: str) -> bool:
 
     «не позднее 5-го числа» — это дата, а не значение: цифра есть, смысла нет.
     """
-    if re.search(r"\d[\d\s]{2,}", text):          # 450 000
+    if re.search(r"\d[\d\s]{2,}", text):
         return True
-    if re.search(r"\d+[.,]\d+\s*%", text):        # 0,05%
+    if re.search(r"\d+[.,]\d+\s*%", text):
         return True
     if re.search(r"\d+\s*(?:%|процент|руб|дн)", text):
         return True
@@ -1145,6 +1310,39 @@ def wants_value(question: str) -> bool:
 def asks_timing(question: str) -> bool:
     low = question.lower()
     return any(marker in low for marker in TIMING_MARKERS)
+
+
+def pick_snippet(chunk: dict, question: str, limit: int = 300) -> str:
+    """Сниппет источника: на вопрос о сумме первым идёт предложение с суммой.
+
+    Раньше брался просто text[:300], и на «какая арендная плата» в источнике
+    оказывался пункт про дату внесения без самой суммы.
+    """
+    text = str(chunk.get("text") or "").strip()
+    if len(text) <= limit:
+        return text
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.;])\s+", text) if s.strip()]
+    if not sentences:
+        return text[:limit]
+
+    if wants_value(question) and not asks_timing(question):
+        ranked = sorted(sentences, key=lambda s: (has_amount(s), len(s)), reverse=True)
+        snippet = ranked[0]
+    else:
+        snippet = sentences[0]
+    return snippet[:limit] if len(snippet) > limit else snippet
+# <<< GENERATED:textsel
+
+
+# вопросы про время: значение важнее, но порядок не переставляем —
+# на «когда вносится плата» ответ должен начинаться со срока, а не с суммы
+
+
+
+
+
+
 
 
 def _pick_sentences(chunk: dict, wanted: set[str], limit: int = 320,
