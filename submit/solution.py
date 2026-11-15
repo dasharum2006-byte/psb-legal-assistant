@@ -93,6 +93,14 @@ SNIPPET_CHARS = 1400
 USE_RERANK = env("USE_RERANK", "1") == "1"
 # добавлять ли текст документа целиком (как делает baseline) — эксперимент
 USE_FULL_DOC = env("USE_FULL_DOC", "0") == "1"
+# parent-child: ищем по маленьким пунктам, а модели отдаём весь раздел
+# Замер на 18 демо-вопросах: parent-child не выиграл ни в одном режиме
+# (см. scripts/compare_runs.py). По умолчанию выключен, но код оставлен:
+# включить = USE_PARENT=1, режим = PARENT_MODE=replace|append.
+USE_PARENT = env("USE_PARENT", "0") in ("1", "replace", "append")
+# replace: раздел вместо пункта; append: пункт + раздел (пункт сохраняет точность)
+PARENT_MODE = env("PARENT_MODE", "replace")
+PARENT_LIMIT = int(env("PARENT_LIMIT", "2500"))
 
 _PROXY_WARNED = False
 
@@ -369,6 +377,74 @@ def _split_long(body: str, limit: int = 1500) -> list[str]:
     return result
 
 
+def _attach_parents(chunks: list[dict], limit: int = PARENT_LIMIT) -> None:
+    """Собрать для каждого пункта «родителя» — раздел или статью целиком.
+
+    Поиск идёт по пунктам (точные эмбеддинги), а модели полезнее весь раздел:
+    на «какая арендная плата» ответ бывает в соседнем пункте того же раздела.
+    """
+    groups: dict[tuple, list[int]] = {}
+    for index, chunk in enumerate(chunks):
+        key = (chunk["doc"], chunk.get("section") or chunk["clause"].split(".")[0])
+        groups.setdefault(key, []).append(index)
+
+    for key, indexes in groups.items():
+        parts = [chunks[i]["text"] for i in indexes]
+        parent = " ".join(parts).strip()
+        if len(parent) > limit:
+            # берём начало и конец раздела: обычно сумма в начале, оговорки — в конце
+            head = parent[: limit * 2 // 3]
+            tail = parent[-limit // 3:]
+            parent = f"{head} … {tail}"
+        for i in indexes:
+            chunks[i]["parent_text"] = parent
+            chunks[i]["parent_key"] = f"{key[0]}|{key[1]}"
+
+
+def expand_parents(chunks: list[dict], limit_chars: int = 6000,
+                   mode: str = "replace") -> list[dict]:
+    """Подмешать родительские разделы к найденным пунктам.
+
+    replace — раздел вместо пункта (модель видит соседние пункты, но теряет
+    точную формулировку); append — пункт остаётся, раздел добавляется рядом.
+    """
+    if not chunks:
+        return chunks
+    if mode == "append":
+        result, seen, used = [], set(), 0
+        for chunk in chunks:
+            key = (chunk["doc"], chunk["clause"])
+            if key not in seen:
+                seen.add(key)
+                result.append(chunk)
+                used += len(chunk["text"])
+        for chunk in chunks:
+            parent = chunk.get("parent_text")
+            parent_key = ("§", chunk.get("parent_key"))
+            if not parent or parent_key in seen:
+                continue
+            if used + len(parent) > limit_chars:
+                continue
+            seen.add(parent_key)
+            used += len(parent)
+            result.append({**chunk, "clause": chunk.get("section") or "раздел", "text": parent})
+        return result
+    result, seen, used = [], set(), 0
+    for chunk in chunks:
+        parent = chunk.get("parent_text") or chunk["text"]
+        key = chunk.get("parent_key") or (chunk["doc"], chunk["clause"])
+        if key in seen:
+            continue
+        if result and used + len(parent) > limit_chars:
+            continue
+        seen.add(key)
+        used += len(parent)
+        expanded = dict(chunk)
+        expanded["text"] = parent
+        result.append(expanded)
+    return result or chunks
+
+
 def chunk_documents(documents: list[dict]) -> list[dict]:
     """Разложить документы на чанки: пункт/статья = один чанк.
 
@@ -458,6 +534,7 @@ def chunk_documents(documents: list[dict]) -> list[dict]:
 
         decorate(doc, produced)
 
+    _attach_parents(chunks)
     return chunks
 
 
@@ -1232,6 +1309,8 @@ def answer_question(
                         "repealed": selected[0].get("repealed", False),
                     })
         selected = with_neighbours(selected, retriever.chunks)
+        if USE_PARENT:
+            selected = expand_parents(selected, mode=PARENT_MODE)
         text = ask_llm(client, question, selected, history)
 
         if text is None:
