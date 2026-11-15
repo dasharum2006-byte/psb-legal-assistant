@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import re
 import zipfile
 
@@ -128,6 +129,8 @@ def _number(title: str) -> str | None:
     return match.group(1).rstrip(".") if match else None
 
 
+logger = logging.getLogger(__name__)
+
 JUNK_NAMES = ("thumbs.db", ".ds_store", "desktop.ini")
 
 
@@ -153,21 +156,40 @@ def load_documents(kb_path: str) -> list[dict]:
     """Прочитать документы из zip (или папки) с метаданными."""
     documents: list[dict] = []
 
+    def read_one(filename: str, raw: bytes) -> None:
+        """Разбор одного файла: битый файл не должен ронять всю загрузку."""
+        try:
+            text = raw.decode("utf-8-sig", errors="replace")
+            documents.append(_make_document(filename, text))
+        except Exception as exc:  # повреждённый файл, битая кодировка и т.п.
+            logger.warning("PARSER_SKIP_FILE: %s: %s: %s", filename, type(exc).__name__, exc)
+
     if kb_path.endswith(".zip"):
         with zipfile.ZipFile(kb_path, "r") as archive:
             for filename in archive.namelist():
                 if not filename.endswith(".txt") or _is_junk(filename):
                     continue
-                with archive.open(filename) as handle:
-                    text = handle.read().decode("utf-8-sig", errors="replace")
-                documents.append(_make_document(filename, text))
+                try:
+                    with archive.open(filename) as handle:
+                        raw = handle.read()
+                except Exception as exc:
+                    logger.warning("PARSER_READ_FAILED: %s: %s", filename, exc)
+                    continue
+                read_one(filename, raw)
     else:
         for name in sorted(os.listdir(kb_path)):
-            if not name.endswith(".txt"):
+            if not name.endswith(".txt") or _is_junk(name):
                 continue
-            with open(os.path.join(kb_path, name), encoding="utf-8-sig", errors="replace") as handle:
-                documents.append(_make_document(name, handle.read()))
+            try:
+                with open(os.path.join(kb_path, name), "rb") as handle:
+                    raw = handle.read()
+            except OSError as exc:
+                logger.warning("PARSER_READ_FAILED: %s: %s", name, exc)
+                continue
+            read_one(name, raw)
 
+    if not documents:
+        logger.warning("PARSER_EMPTY: в %s нет читаемых документов", kb_path)
     return documents
 
 

@@ -330,7 +330,9 @@ def load_documents(path: Path) -> list[dict]:
                 "text": text,
             })
     if not documents:
-        raise SystemExit("в архиве нет читаемых документов")
+        # Библиотека не падает: пустой список обрабатывается выше — ответы
+        # станут отказами, но валидный submission.csv будет создан.
+        print("в архиве нет читаемых документов", file=sys.stderr)
     return documents
 
 
@@ -589,9 +591,13 @@ def _section_at(sections: list[tuple[int, str]], position: int) -> str:
 class Retriever:
     def __init__(self, chunks: list[dict]) -> None:
         self.chunks = chunks
-        self.bm25 = BM25Okapi([tokenize(c["searchable"]) for c in chunks])
+        # BM25 на пустом корпусе падает делением на ноль — база может быть
+        # нечитаемой, и тогда поиск просто ничего не находит.
+        self.bm25 = BM25Okapi([tokenize(c["searchable"]) for c in chunks]) if chunks else None
 
     def search(self, question: str, k: int = TOP_K) -> list[dict]:
+        if not self.chunks or self.bm25 is None:
+            return []
         scores = self.bm25.get_scores(tokenize(question))
 
         # Буст по упоминанию документа в вопросе: номер договора или

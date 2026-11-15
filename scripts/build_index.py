@@ -16,10 +16,18 @@ def main(kb_path):
     print(f"1. Читаем документы из {kb_path}...")
     docs = load_documents(kb_path)
     print(f"   Прочитано документов: {len(docs)}")
+    # Ручная сборка должна падать громко: пустой индекс — почти всегда
+    # не тот путь к архиву, а не пустая база.
+    if not docs:
+        print(f"❌ в {kb_path} нет читаемых документов", file=sys.stderr)
+        sys.exit(1)
     
     print("2. Режем документы на чанки...")
     chunks = chunk_documents(docs)
     print(f"   Получено чанков: {len(chunks)}")
+    if not chunks:
+        print("❌ документы прочитаны, но чанков нет", file=sys.stderr)
+        sys.exit(1)
     
     print("3. Строим индекс BM25...")
     # Вызываем функцию из retriever.py, она сохранит индекс в памяти
@@ -55,5 +63,7 @@ def main(kb_path):
     print(f"   meta: {meta['chunks']} чанков, отпечаток кода {meta['code_fingerprint']}")
 
 if __name__ == "__main__":
-    # Путь к архиву. Если запускаешь из корня проекта, путь такой:
-    main("data/knowledge-base.zip")
+    # Путь к архиву можно передать аргументом; без аргумента берём стандартный.
+    # Раньше аргумент молча игнорировался и всегда читался data/knowledge-base.zip.
+    kb = sys.argv[1] if len(sys.argv) > 1 else "data/knowledge-base.zip"
+    main(kb)

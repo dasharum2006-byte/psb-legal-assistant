@@ -34,7 +34,8 @@ def build_index(chunks: list[dict]):
     global _bm25_index, _chunks_store
     _chunks_store = chunks
     tokenized_corpus = [tokenize(chunk.get('searchable', chunk['text'])) for chunk in _chunks_store]
-    _bm25_index = BM25Okapi(tokenized_corpus)
+    # пустой корпус — валидное состояние (архив не прочитался), BM25 на нём падает
+    _bm25_index = BM25Okapi(tokenized_corpus) if tokenized_corpus else None
     print(f"Индекс ВМ25 построен на {len(chunks)} чанках")
 
 # Номера документов: «А-08/2024», «П-17/2024», «ПТ-05/2023», «ЮО-7», «К-12».
@@ -233,6 +234,7 @@ def load_index_from_disk(index_dir: str = "data/index"):
             
     # Перестраиваем индекс (быстро, так как чанков немного)
     tokenized_corpus = [tokenize(chunk.get('searchable', chunk['text'])) for chunk in _chunks_store]
-    _bm25_index = BM25Okapi(tokenized_corpus)
+    # пустой корпус — валидное состояние (архив не прочитался), BM25 на нём падает
+    _bm25_index = BM25Okapi(tokenized_corpus) if tokenized_corpus else None
     print(f"✅ Индекс загружен с диска: {len(_chunks_store)} чанков")
 
