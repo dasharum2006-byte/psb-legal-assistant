@@ -180,6 +180,41 @@ def search(query: str, k: int = 8) -> list[dict]:
         
     return results
 
+def next_chunk(chunk: dict, limit: int = 1) -> list[dict]:
+    """Следующие по порядку чанки того же документа.
+
+    Ответ часто разбит на два пункта: 3.1 — сумма, 3.2 — срок внесения.
+    Поиск приносит только один из них, поэтому соседа подклеиваем отдельно.
+    Ограничение одним документом не даёт тащить в контекст чужие пункты.
+    """
+    if not _chunks_store:
+        return []
+    position = None
+    chunk_id = chunk.get("chunk_id") or ""
+    doc_id = chunk.get("doc_id") or ""
+    for index, item in enumerate(_chunks_store):
+        if chunk_id and item.get("chunk_id") == chunk_id:
+            position = index
+            break
+        if not chunk_id and item.get("doc_id") == doc_id and item.get("clause") == chunk.get("clause"):
+            position = index
+            break
+    if position is None:
+        return []
+
+    found = []
+    for index in range(position + 1, min(position + 1 + limit * 3, len(_chunks_store))):
+        item = _chunks_store[index]
+        if item.get("doc_id") != _chunks_store[position].get("doc_id"):
+            break
+        if item.get("clause") == chunk.get("clause"):
+            continue
+        found.append(dict(item))
+        if len(found) >= limit:
+            break
+    return found
+
+
 def load_index_from_disk(index_dir: str = "data/index"):
     """
     Загружает чанки из файла и строит индекс BM25.

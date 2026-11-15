@@ -228,6 +228,41 @@ def find_date(question: str) -> str | None:
 
 
 # сортируем чанки по убыванию
+NEIGHBOURS = os.getenv("NEIGHBOURS", "1") == "1"
+NEIGHBOUR_CHARS = int(os.getenv("NEIGHBOUR_CHARS", "6000"))
+# к скольким лучшим чанкам подклеивать соседа: 1 — минимум шума, 2 — больше полноты
+NEIGHBOUR_TOP = int(os.getenv("NEIGHBOUR_TOP", "1"))
+
+
+def add_neighbours(picked: list[dict], retriever, budget: int = NEIGHBOUR_CHARS) -> list[dict]:
+    """Доклеить следующие пункты того же документа к топ-1 и топ-2 чанкам.
+
+    Бюджет считается отдельно: соседи не вытесняют уже отобранное, а
+    занимают только свободный остаток.
+    """
+    if not picked or not hasattr(retriever, "next_chunk"):
+        return picked
+
+    used = sum(len(chunk.get("text", "")) for chunk in picked)
+    seen = {(chunk.get("doc_id"), chunk.get("clause")) for chunk in picked}
+    result = list(picked)
+
+    for chunk in picked[:NEIGHBOUR_TOP]:
+        for neighbour in retriever.next_chunk(chunk, limit=1):
+            key = (neighbour.get("doc_id"), neighbour.get("clause"))
+            if key in seen:
+                continue
+            size = len(neighbour.get("text", ""))
+            if used + size > budget:
+                break
+            seen.add(key)
+            used += size
+            adapted = _adapt(neighbour)
+            adapted["score"] = float(neighbour.get("score", chunk.get("score", 0)))
+            result.append(adapted)
+    return result
+
+
 def select_chunks(chunks: list[dict], max_chars: int = 6000, max_per_doc: int = 3) -> list[dict]:              
     """Отобрать куски под бюджет символов: по score, не больше N с документа."""                               
     picked = []                                                                                                
@@ -389,6 +424,12 @@ def ask(
     picked = select_chunks(chunks)
     if not picked:
         return _refusal("no_chunks")
+
+    # 3a. соседние пункты: ответ часто разбит на два пункта подряд
+    # (3.1 — сумма, 3.2 — срок). Добавляем только в свободный остаток
+    # бюджета и только к двум самым сильным чанкам.
+    if NEIGHBOURS:
+        picked = add_neighbours(picked, retriever)
 
     # 4. генерация
     client = client or LLMClient()
