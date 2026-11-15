@@ -33,7 +33,8 @@ def split_dialog(question: str) -> tuple[str, list[dict]]:
 
 def main() -> None:
     out = sys.argv[1] if len(sys.argv) > 1 else "backend_answers.csv"
-    retriever.load_index_from_disk(str(ROOT / "data/index"))
+    index_dir = os.getenv("INDEX_DIR", str(ROOT / "data/index"))
+    retriever.load_index_from_disk(index_dir)
     rows = list(csv.DictReader(open(ROOT / "data/demo_questions.csv", encoding="utf-8-sig")))
     with open(out, "w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, quoting=csv.QUOTE_ALL, lineterminator="\n")

@@ -247,3 +247,8 @@ secrets.*
 # project: артефакты прогонов
 data/eval_*.csv
 *.log
+
+# артефакты замеров (не код)
+submission_*.csv
+backend_*.csv
+data/index_submit_chunks/
