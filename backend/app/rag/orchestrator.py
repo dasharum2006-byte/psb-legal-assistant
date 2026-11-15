@@ -229,6 +229,17 @@ def find_date(question: str) -> str | None:
 
 # сортируем чанки по убыванию
 NEIGHBOURS = os.getenv("NEIGHBOURS", "1") == "1"
+# платформенные эндпоинты /embeddings и /rerank: если их нет — молча BM25
+USE_SEMANTIC = os.getenv("USE_SEMANTIC", "1") == "1"
+USE_RERANK = os.getenv("USE_RERANK", "1") == "1"
+RERANK_TOP = int(os.getenv("RERANK_TOP", "6"))
+# сколько лучших кандидатов BM25 вернуть после реранкера, если он их потерял
+RERANK_FALLBACK = int(os.getenv("RERANK_FALLBACK", "4"))
+# порог косинуса: ниже — считаем, что по смыслу ничего не подходит
+SEMANTIC_MIN = float(os.getenv("SEMANTIC_MIN", "0.45"))
+# сильная семантика: при слабом BM25 этого достаточно, чтобы не отказывать
+SEMANTIC_STRICT = float(os.getenv("SEMANTIC_STRICT", "0.62"))
+SEMANTIC_CANDIDATES = int(os.getenv("SEMANTIC_CANDIDATES", "12"))
 NEIGHBOUR_CHARS = int(os.getenv("NEIGHBOUR_CHARS", "6000"))
 # к скольким лучшим чанкам подклеивать соседа: 1 — минимум шума, 2 — больше полноты
 NEIGHBOUR_TOP = int(os.getenv("NEIGHBOUR_TOP", "1"))
@@ -263,25 +274,38 @@ def add_neighbours(picked: list[dict], retriever, budget: int = NEIGHBOUR_CHARS)
     return result
 
 
-def select_chunks(chunks: list[dict], max_chars: int = 6000, max_per_doc: int = 3) -> list[dict]:              
-    """Отобрать куски под бюджет символов: по score, не больше N с документа."""                               
-    picked = []                                                                                                
-    used = 0                                                                                                   
-    per_doc = {}                                                                                               
-                                                                                                                  
-    for chunk in sorted(chunks, key=lambda chunk: chunk.get("score", 0), reverse=True):                        
-        key = chunk.get("doc_id") or chunk.get("doc") or chunk.get("title", "")                                
-        if per_doc.get(key, 0) >= max_per_doc:                                                                 
-            continue                                                                                                                                                                                                     
-        size = len(chunk.get("text", ""))                                                                      
-        if picked and used + size > max_chars:                                                                 
-            break                                                                                              
-                                                                                                                  
-        picked.append(chunk)                                                                                   
-        used += size                                                                                           
-        per_doc[key] = per_doc.get(key, 0) + 1                                                                 
-                                                                                                                  
-    return picked    
+def select_chunks(
+    chunks: list[dict],
+    max_chars: int = 6000,
+    max_per_doc: int = 3,
+    preserve_order: bool = False,
+) -> list[dict]:
+    """Отобрать куски под бюджет символов: не больше N с документа.
+
+    preserve_order=True нужен после эмбеддингов/реранкера: их порядок — это
+    и есть результат ранжирования. Сортировка по старому BM25-score снова
+    отбрасывала бы лучший пункт вниз, и реранкер фактически не влиял бы.
+    """
+    picked = []
+    used = 0
+    per_doc = {}
+    candidates = chunks if preserve_order else sorted(
+        chunks, key=lambda chunk: chunk.get("score", 0), reverse=True
+    )
+
+    for chunk in candidates:
+        key = chunk.get("doc_id") or chunk.get("doc") or chunk.get("title", "")
+        if per_doc.get(key, 0) >= max_per_doc:
+            continue
+        size = len(chunk.get("text", ""))
+        if picked and used + size > max_chars:
+            continue
+
+        picked.append(chunk)
+        used += size
+        per_doc[key] = per_doc.get(key, 0) + 1
+
+    return picked
 
 # ─────────────────────── сборка пайплайна ───────────────────────
 
@@ -300,6 +324,9 @@ def _adapt(chunk: dict) -> dict:
         "revision": chunk.get("revision"),
         "clause": clause,
         "text": chunk.get("text", ""),
+        "searchable": chunk.get("searchable", ""),
+        "chunk_id": chunk.get("chunk_id", ""),
+        "section": chunk.get("section"),
         "score": float(chunk.get("score", 0)),
         "status": chunk.get("status"),
         "valid_from": chunk.get("valid_from"),
@@ -342,6 +369,66 @@ def _post_filter(chunks: list[dict], analysis: dict, filters: dict | None = None
                 continue
         result.append(chunk)
     return result
+
+
+def _chunk_key(chunk: dict) -> str:
+    """Ключ уникальности чанка для склейки BM25 и семантики."""
+    return str(
+        chunk.get("chunk_id")
+        or f"{chunk.get('doc_id') or chunk.get('doc') or ''}::{chunk.get('clause') or ''}"
+    )
+
+
+def expand_with_semantics(
+    chunks: list[dict],
+    retriever,
+    analysis: dict,
+    filters: dict | None = None,
+) -> tuple[list[dict], float]:
+    """Добавить кандидатов, найденных по смыслу среди ВСЕХ чанков.
+
+    BM25 отдаёт top-k, и перефразированный пункт часто остаётся за его
+    пределами. Здесь эмбеддинг ищет независимо, а найденное склеивается с
+    BM25-выдачей. Возвращаем ещё и лучший косинус — по нему отличаем
+    «нет данных» от «есть, но сформулировано иначе».
+    """
+    if not USE_SEMANTIC:
+        return chunks, 0.0
+
+    from app.rag import semantic
+
+    if not semantic.embeddings_available():
+        return chunks, 0.0
+
+    get_all = getattr(retriever, "all_chunks", None)
+    pool_raw = get_all() if callable(get_all) else list(getattr(retriever, "_chunks_store", []))
+    if not pool_raw:
+        return chunks, 0.0
+
+    pool = _post_filter([_adapt(chunk) for chunk in pool_raw], analysis, filters)
+    candidates, best = semantic.semantic_candidates(
+        analysis["search_query"], pool, k=SEMANTIC_CANDIDATES, min_score=SEMANTIC_MIN
+    )
+    if not candidates:
+        return chunks, best
+
+    by_key = {_chunk_key(chunk): chunk for chunk in chunks}
+    for candidate in candidates:
+        key = _chunk_key(candidate)
+        similarity = float(candidate.get("semantic_score", 0.0))
+        existing = by_key.get(key)
+        if existing is not None:
+            existing["semantic_score"] = similarity
+            continue
+
+        item = dict(candidate)
+        # приводим к масштабу BM25, чтобы score в источниках был осмысленным
+        item["score"] = max(float(item.get("score", 0.0)), similarity * 10.0)
+        item["semantic_score"] = similarity
+        chunks.append(item)
+        by_key[key] = item
+
+    return chunks, best
 
 
 def _refusal(reason: str, missing: list[str] | None = None) -> dict:
@@ -417,17 +504,66 @@ def ask(
         return _refusal("llm_unavailable")
 
     chunks = _post_filter([_adapt(chunk) for chunk in raw], analysis, filters)
+    bm25_best = max((float(chunk.get("score", 0)) for chunk in chunks), default=0.0)
 
-    # 2. порог: шкала определяется по максимальному очку
-    threshold = score_threshold([chunk["score"] for chunk in chunks])
-    chunks = [chunk for chunk in chunks if chunk["score"] >= threshold]
+    # 1a. гибридный поиск: семантика добавляет кандидатов, которых нет в
+    # top-k BM25, а не только переставляет уже найденное.
+    chunks, semantic_best = expand_with_semantics(chunks, retriever, analysis, filters)
+
+    # 2. порог: шкала определяется по максимальному очку. Если и BM25, и
+    # семантика слабые — в базе действительно нет ответа, честно отказываем.
+    if not chunks:
+        return _refusal("no_chunks")
+    threshold = score_threshold([float(chunk.get("score", 0)) for chunk in chunks])
+    if bm25_best < threshold and semantic_best < SEMANTIC_STRICT:
+        logger.info(
+            "RETRIEVAL no_data bm25_best=%.1f semantic_best=%.3f threshold=%.1f",
+            bm25_best, semantic_best, threshold,
+        )
+        return _refusal("no_chunks")
+    chunks = [
+        chunk for chunk in chunks
+        if float(chunk.get("score", 0)) >= threshold
+        or float(chunk.get("semantic_score", 0)) >= SEMANTIC_MIN
+    ]
     if not chunks:
         return _refusal("no_chunks")
 
-    # 3. отбор под бюджет и склейка
-    picked = select_chunks(chunks)
+    # 2a. эмбеддинги и реранк: те же шаги, что в зачётном сабмите.
+    # Любой сбой (нет эндпоинта, таймаут) оставляет порядок BM25 как есть.
+    embeddings_on = rerank_on = False
+    if USE_SEMANTIC or USE_RERANK:
+        from app.rag import semantic
+
+        if USE_SEMANTIC and semantic.embeddings_available():
+            chunks = semantic.order_by_similarity(analysis["search_query"], chunks)
+            embeddings_on = True
+        if USE_RERANK and semantic.rerank_available():
+            reranked = semantic.rerank(
+                analysis["search_query"], chunks, top_n=min(RERANK_TOP, len(chunks))
+            )
+            # реранкер иногда теряет нужный пункт: возвращаем лучшие BM25/
+            # эмбеддинг-кандидаты, которых в его списке нет (как в сабмите)
+            seen = {_chunk_key(chunk) for chunk in reranked}
+            fallback = [
+                chunk for chunk in chunks[:RERANK_FALLBACK]
+                if _chunk_key(chunk) not in seen
+            ]
+            chunks = reranked + fallback
+            rerank_on = True
+
+    # 3. отбор под бюджет и склейка. preserve_order обязателен: иначе
+    # select_chunks сортирует по старому BM25-score и отменяет реранк.
+    picked = select_chunks(chunks, preserve_order=True)
     if not picked:
         return _refusal("no_chunks")
+
+    logger.info(
+        "RETRIEVAL bm25=%d bm25_best=%.1f semantic_best=%.3f threshold=%.1f "
+        "candidates=%d picked=%d embeddings=%s rerank=%s",
+        len(raw), bm25_best, semantic_best, threshold,
+        len(chunks), len(picked), embeddings_on, rerank_on,
+    )
 
     # 3a. соседние пункты: ответ часто разбит на два пункта подряд
     # (3.1 — сумма, 3.2 — срок). Добавляем только в свободный остаток

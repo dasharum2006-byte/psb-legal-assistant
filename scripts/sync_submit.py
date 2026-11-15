@@ -21,6 +21,7 @@ sys.path.insert(0, str(BACKEND))
 BLOCKS = {
     "parser": ("app/rag/parser.py", None),
     "textsel": ("app/rag/textsel.py", None),
+    "metadata": ("app/rag/metadata.py", None),
 }
 
 

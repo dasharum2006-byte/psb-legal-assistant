@@ -19,6 +19,32 @@ fail() { echo "❌ $1"; EXIT=1; }
 ok()   { echo "✅ $1"; }
 EXIT=0
 
+# Локальный .env нужен, чтобы solution.py ходил в реальную LLM, а не
+# деградировал в экстрактивные цитаты. На платформе переменные придут
+# из окружения, поэтому в архив .env не попадает.
+ENV_LOADED=0
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+  ENV_LOADED=1
+  ok ".env загружен"
+else
+  echo "⚠️  .env не найден — проверка пойдёт без LLM (экстрактивные ответы)"
+fi
+
+if [ "$ENV_LOADED" -eq 1 ]; then
+  LLM_BASE="${LLM_BASE_URL:-${BASE_URL:-${OPENAI_BASE_URL:-}}}"
+  LLM_TOKEN="${LLM_API_KEY:-${OPENAI_API_KEY:-}}"
+  if [ -n "$LLM_BASE" ] && [ -n "$LLM_TOKEN" ]; then
+    echo "   LLM base: $LLM_BASE"
+  else
+    echo "⚠️  .env загружен, но LLM_BASE_URL / LLM_API_KEY пустые —"
+    echo "   ответы будут экстрактивными, а не от модели"
+  fi
+fi
+
 echo "── 1. синтаксис solution.py ──"
 if "$VENV" -c "import ast,sys; ast.parse(open('submit/solution.py').read())"; then
   ok "синтаксис в порядке"
@@ -70,6 +96,16 @@ PY
 [ "$TOTAL" -eq 18 ] && ok "ответов: $TOTAL" || fail "ответов: $TOTAL (ожидалось 18)"
 [ "$EMPTY" -eq 0 ] && ok "пустых ответов нет" || fail "пустых ответов: $EMPTY"
 [ "$CITED" -ge 12 ] && ok "со ссылкой на источник: $CITED из $TOTAL" || fail "со ссылкой только $CITED из $TOTAL"
+
+echo "── 3a. diff с data/demo_output.csv ──"
+if [ -f data/demo_output.csv ]; then
+  # диагностика, не блокирует сабмит: LLM может сформулировать иначе,
+  # но MISSED/REFUSE_BAD и расхождения по числам/ссылкам видны сразу
+  "$VENV" scripts/compare_with_gold.py || \
+    echo "⚠️  сравнение с эталоном не удалось (на сабмит не влияет)"
+else
+  echo "⚠️  data/demo_output.csv не найден — diff пропущен"
+fi
 
 echo "── 4. сборка архива ──"
 bash scripts/make_submit.sh >/dev/null

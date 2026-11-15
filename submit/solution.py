@@ -24,6 +24,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 import urllib.request
 import zipfile
@@ -70,6 +71,7 @@ RERANKER_MODEL = env("RERANKER_MODEL", "cohere/rerank-5-fast")
 # Берём не меньше своих минимумов.
 TOP_K = max(env_int("TOP_K", 14, 1, 20), 12)
 RERANKER_TOP_N = max(env_int("RERANKER_TOP_N", 6, 1, 8), 6)
+NEIGHBOUR_CHARS = env_int("NEIGHBOUR_CHARS", 2200, 500, 10000)
 MAX_TOKENS = max(env_int("MAX_TOKENS", 1500, 128, 8192), 1200)
 # платформа может передать 1 поток — на 100 вопросах это упирается в лимит
 # 20 минут, поэтому держим не меньше 4
@@ -160,6 +162,8 @@ QUERY_SYNONYMS = {
     "выдач": "выдава оригинал архив",
     "претенз": "претензи акт недостатк",
     "недостат": "дефект претензи качеств",
+    "инициатор": "запуст согласован",
+    "запуст": "инициатор согласован",
 }
 
 STOP_WORDS = {
@@ -634,6 +638,8 @@ def chunk_documents(documents: list[dict]) -> list[dict]:
                 "section": section,
                 "text": text,
                 "repealed": doc["repealed"],
+                "revision": doc.get("revision"),
+                "date": doc.get("date"),
                 # название раздела помогает находить пункты по теме вопроса
                 # («ответственность сторон», «арендная плата»)
                 "searchable": f"{doc['title']} {section} {item['clause']} {text}".strip(),
@@ -750,46 +756,318 @@ def _section_at(sections: list[tuple[int, str]], position: int) -> str:
 
 # ─────────────────────── поиск ───────────────────────
 
+# >>> GENERATED:metadata
+import re
+from collections import Counter
+
+# Номера документов: «А-08/2024», «П-17/2024», «ПТ-05/2023», «ЮО-7», «К-12».
+# Общая схема, а не список известных договоров: работает и на приватном наборе.
+DOC_NUMBER_RE = re.compile(r"(?<![а-яa-z0-9])([а-я]{1,4})[-‑](\d{1,4})(?:/(\d{4}))?", re.I)
+# Ссылки на статью или пункт: «ст. 70», «статья 70», «п. 3.1».
+CLAUSE_REF_RE = re.compile(r"(?:ст\.|стать[яию]|п\.|пункт)\s*(\d+(?:\.\d+)*)", re.I)
+# Названия в кавычках: «Альфа-Трейд», "Альфа-Трейдинг".
+QUOTED_NAME_RE = re.compile(r"[«\"“]([^«»\"“”]{2,80})[»\"”]")
+# Прошлые годы: вопрос про редакцию на дату — старые редакции не штрафуем.
+PAST_YEAR_RE = re.compile(r"(?<!\d)20(?:20|21|22|23|24)(?!\d)")
+
+# Слова, которые есть почти в любом заголовке и ничего не различают
+TITLE_STOPWORDS = {
+    "служебная", "записка", "письмо", "исходящее", "договор", "поставки",
+    "аренды", "нежилого", "помещения", "соглашение", "дополнительное",
+    "общество", "ограниченной", "ответственностью", "между", "номер",
+    "российской", "федерации", "статья", "глава",
+}
+
+# Своя компания определяется по базе, а не по названию из демо.
+COMMON_NAME_SHARE = 0.40
+COMMON_NAME_MIN_DOCS = 2
+FOREIGN_NAME_PENALTY = -3.0
+
+
+def question_doc_numbers(text: str) -> set[str]:
+    """Номера документов, упомянутые в вопросе («а-08/2024», «юо-7»).
+
+    Работает и без знака «№»: «Что сказано в записке ЮО-7?».
+    """
+    found = set()
+    for letter, digits, year in DOC_NUMBER_RE.findall(text):
+        found.add(f"{letter}-{digits}".lower())
+        if year:
+            found.add(f"{letter}-{digits}/{year}".lower())
+    return found
+
+
+def question_clause_refs(text: str) -> set[str]:
+    """Ссылки на статью/пункт из вопроса («70», «3.1»)."""
+    return {match.group(1) for match in CLAUSE_REF_RE.finditer(text)}
+
+
+def title_keywords(text: str) -> set[str]:
+    return {
+        word for word in re.findall(r"[а-яa-z]{5,}", text.lower().replace("ё", "е"))
+        if word not in TITLE_STOPWORDS
+    }
+
+
+def question_names(text: str) -> set[str]:
+    """Названия в кавычках, которые надо различить точно.
+
+    «Альфа-Трейд» и «Альфа-Трейдинг» — разные контрагенты, поэтому
+    сравнивать их подстрокой нельзя.
+    """
+    names = set()
+    for raw in QUOTED_NAME_RE.findall(text):
+        name = re.sub(r"\s+", " ", raw.lower().replace("ё", "е")).strip()
+        if len(name) >= 2:
+            names.add(name)
+    return names
+
+
+def _contains_exact(text: str, phrase: str) -> bool:
+    """Фраза совпала целиком, а не как начало другого слова."""
+    if not phrase:
+        return False
+    return re.search(
+        rf"(?<![а-яa-z0-9]){re.escape(phrase)}(?![а-яa-z0-9])", text, re.I
+    ) is not None
+
+
+def has_past_year(text: str) -> bool:
+    """Есть ли в вопросе 2020–2024 как дата, а не год в номере договора."""
+    without_numbers = DOC_NUMBER_RE.sub(" ", text)
+    without_numbers = re.sub(r"\b\d{1,4}/\d{4}\b", " ", without_numbers)
+    return PAST_YEAR_RE.search(without_numbers) is not None
+
+
+def exact_mention_boost(query: str, chunk: dict) -> float:
+    """+25 за точное название в кавычках или номер документа.
+
+    Номер может быть без «№»: «П-17/2024», «ЮО-7». Границы не дают
+    «Альфа-Трейд» совпасть с «Альфа-Трейдинг».
+    """
+    haystack = " ".join(
+        str(chunk.get(key) or "")
+        for key in ("number", "doc_id", "doc", "title", "text")
+    ).lower().replace("ё", "е")
+    flat_haystack = haystack.replace("/", "-")
+
+    for name in question_names(query):
+        if _contains_exact(haystack, name):
+            return 25.0
+    for number in question_doc_numbers(query):
+        if _contains_exact(flat_haystack, number.replace("/", "-")):
+            return 25.0
+    return 0.0
+
+
+def is_repealed(chunk: dict) -> bool:
+    return bool(chunk.get("repealed")) or str(chunk.get("status") or "").lower() == "repealed"
+
+
+def common_quoted_names(chunks: list[dict]) -> set[str]:
+    """Названия, которые встречаются почти во всех документах базы.
+
+    Это «своя компания» (заказчик), её нельзя считать чужим договором.
+    Частоту считаем по уникальным документам, а не по чанкам: у длинного
+    договора иначе был бы несправедливый перевес.
+    """
+    documents: dict[str, dict] = {}
+    for chunk in chunks:
+        key = str(
+            chunk.get("doc")
+            or chunk.get("title")
+            or chunk.get("doc_id")
+            or id(chunk)
+        )
+        documents.setdefault(key, chunk)
+
+    total = len(documents)
+    if not total:
+        return set()
+
+    counts: Counter[str] = Counter()
+    for chunk in documents.values():
+        head = f"{chunk.get('doc') or ''} {str(chunk.get('text') or '')[:300]}"
+        counts.update(question_names(head))
+
+    threshold = max(COMMON_NAME_MIN_DOCS, int(total * COMMON_NAME_SHARE))
+    common = {
+        name for name, count in counts.items()
+        if count >= threshold
+    }
+    if counts:
+        top, count = counts.most_common(1)[0]
+        second = counts.most_common(2)[1][1] if len(counts) > 1 else 0
+        # доминирующее название тоже считаем своим, даже если документов мало
+        if count >= 3 and count >= 2 * max(1, second):
+            common.add(top)
+    return common
+
+
+def relevant_quoted_names(
+    query: str,
+    chunks: list[dict],
+    common_names: set[str] | None = None,
+) -> set[str]:
+    """Названия из вопроса, которые реально встречаются в заголовках базы.
+
+    Так «круглосуточный доступ» в кавычках не считается названием компании
+    и не штрафует все чужие договоры. Своя компания вычисляется по базе
+    один раз в Retriever.__init__ и передаётся сюда.
+    """
+    common = common_quoted_names(chunks) if common_names is None else common_names
+    wanted = {name for name in question_names(query) if name not in common}
+    if not wanted:
+        return set()
+
+    known: set[str] = set()
+    for chunk in chunks:
+        title = f"{chunk.get('doc') or ''} {chunk.get('title') or ''}"
+        known |= wanted & question_names(title)
+        if known == wanted:
+            break
+    return known
+
+
+def foreign_name_penalty(
+    query: str, chunk: dict, relevant_names: set[str] | None = None
+) -> float:
+    """Слегка штрафуем чужой договор, если спросили про конкретную компанию."""
+    wanted = relevant_names
+    if wanted is None:
+        wanted = set(question_names(query))
+    if not wanted:
+        return 0.0
+
+    title = f"{chunk.get('doc') or ''} {chunk.get('title') or ''}".lower().replace("ё", "е")
+    if any(_contains_exact(title, name) for name in wanted):
+        return 0.0
+    title_names = set(question_names(title))
+    if title_names and not (title_names & wanted):
+        return FOREIGN_NAME_PENALTY
+    return 0.0
+
+
+def repealed_penalty(query: str, chunk: dict) -> float:
+    """-12 устаревшей редакции, если вопрос не про прошлый год."""
+    if not is_repealed(chunk):
+        return 0.0
+    return 0.0 if has_past_year(query) else -12.0
+
+
+def metadata_boost(query: str, chunk: dict) -> float:
+    """Бонус за совпадение метаданных: номер документа и ссылка на пункт.
+
+    Без него нужный пункт остаётся на 15-25 месте: BM25 не знает, что
+    «П-17/2024» в вопросе и в заголовке — одно и то же.
+    """
+    bonus = exact_mention_boost(query, chunk)
+    numbers = question_doc_numbers(query)
+    refs = question_clause_refs(query)
+
+    chunk_number = str(chunk.get("number") or "").lower().replace("№", "").strip()
+    haystack = f"{chunk_number} {chunk.get('doc_id', '')} {chunk.get('doc', '')}".lower().replace("/", "-")
+
+    # +25 за точное название/номер; старый +15 остаётся запасным путём,
+    # если номер в документе записан в другой форме.
+    if not bonus:
+        for number in numbers:
+            flat = number.replace("/", "-")
+            if flat and flat in haystack:
+                bonus += 15.0
+                break
+    if refs:
+        clause = str(chunk.get("clause") or "").lower()
+        core = clause.replace("ст.", "").replace("п.", "").strip()
+        if core and any(ref == core or core.startswith(ref + ".") for ref in refs):
+            bonus += 10.0
+
+    matched = title_keywords(query) & title_keywords(str(chunk.get("doc") or ""))
+    bonus += 3.0 * len(matched)
+    return bonus
+# <<< GENERATED:metadata
+
+# Служебные слова шапки: они есть почти в каждом пункте договора и не должны
+# считаться смыслом вопроса. Берём именно стемы, которые даёт tokenize.
+META_NOISE_TOKENS = set(tokenize("договор поставка аренда регламент записка письмо ооо"))
+
+
 class Retriever:
     def __init__(self, chunks: list[dict]) -> None:
         self.chunks = chunks
         # BM25 на пустом корпусе падает делением на ноль — база может быть
         # нечитаемой, и тогда поиск просто ничего не находит.
         self.bm25 = BM25Okapi([tokenize(c["searchable"]) for c in chunks]) if chunks else None
+        self.body_tokens = [
+            significant_tokens(str(chunk.get("text") or "")) for chunk in chunks
+        ]
+        self.section_tokens = [
+            significant_tokens(str(chunk.get("section") or "")) for chunk in chunks
+        ]
+        # Своя компания определяется по частоте в шапках документов, а не
+        # по захардкоженному «Меридиан».
+        self.common_quoted_names = common_quoted_names(chunks)
+        # Компания может быть указана только в одном абзаце договора
+        # (например, в реквизитах), но вопрос относится ко всему документу.
+        self.doc_quoted_names: dict[str, set[str]] = {}
+        for chunk in chunks:
+            doc = str(chunk.get("doc") or "")
+            names = question_names(f"{doc} {str(chunk.get('text') or '')}")
+            if names:
+                self.doc_quoted_names.setdefault(doc, set()).update(names)
 
-    def search(self, question: str, k: int = TOP_K) -> list[dict]:
+    def search(self, question: str, k: int = TOP_K, topic_query: str = "") -> list[dict]:
         if not self.chunks or self.bm25 is None:
             return []
         scores = self.bm25.get_scores(tokenize(question))
 
-        # Буст по упоминанию документа в вопросе: номер договора или
-        # название контрагента. Иначе нужный пункт остаётся на 15-25 месте,
-        # и ни реранкер, ни модель его не увидят.
-        low_question = question.lower().replace("ё", "е")
-        number_markers = [
-            marker.lower().replace("№", "").strip()
-            for marker in re.findall(r"№\s*[А-ЯA-Z0-9][А-ЯA-Z0-9./\-]*", question)
-        ]
-        titles_cache: dict[str, set[str]] = {}
+        # Буст по метаданным из общего блока metadata: номер документа
+        # (в том числе без «№»: «записка ЮО-7»), точное название в кавычках
+        # («Альфа-Трейд» ≠ «Альфа-Трейдинг») и ссылка на пункт/статью.
+        # Устаревшие редакции и чужую компанию штрафуем.
+        relevant_names = relevant_quoted_names(
+            question, self.chunks, self.common_quoted_names
+        )
+        query_company_names = {
+            name for name in question_names(question)
+            if name not in self.common_quoted_names
+        }
+
+        # Смысловые слова берём из последней реплики пользователя, а не из
+        # всей истории: иначе «пользователь», «ассистент», «подскажите»
+        # начинают поднимать случайные пункты.
+        if topic_query:
+            topic_text = topic_query
+        else:
+            _, topic_text = split_dialog(question)
+        topic_text = expand_query(topic_text)
+        quoted_tokens: set[str] = set()
+        for name in question_names(question):
+            quoted_tokens |= significant_tokens(name)
+        topic_tokens = significant_tokens(topic_text) - quoted_tokens - META_NOISE_TOKENS
+
         for index, chunk in enumerate(self.chunks):
-            title = chunk["doc"]
-            if title not in titles_cache:
-                titles_cache[title] = significant_tokens(title)
-
-            bonus = 0.0
-            title_low = title.lower().replace("ё", "е")
-
-            # 1) номер документа из вопроса есть в названии
-            for marker in number_markers:
-                if marker and marker in title_low.replace("/", "-"):
-                    bonus += 15.0
-                    break
-
-            # 2) редкие слова названия документа встречаются в вопросе
-            matched = titles_cache[title] & significant_tokens(low_question)
-            if matched:
-                bonus += 3.0 * len(matched)
-
+            bonus = (
+                metadata_boost(question, chunk)
+                + repealed_penalty(question, chunk)
+                + foreign_name_penalty(question, chunk, relevant_names)
+            )
+            # +25 к любому пункту документа, если компания из вопроса
+            # встречается в другой части этого же договора (реквизиты/шапка).
+            if (
+                query_company_names
+                and not exact_mention_boost(question, chunk)
+                and query_company_names & self.doc_quoted_names.get(chunk.get("doc"), set())
+            ):
+                bonus += 25.0
+            if topic_tokens:
+                # Совпадение в теле пункта и, особенно, в названии раздела:
+                # «плата»/«доступ» должны бить общие слова «арендатор»/«помещение».
+                body_hits = len(self.body_tokens[index] & topic_tokens)
+                section_hits = len(self.section_tokens[index] & topic_tokens)
+                # одно общее слово вроде «размер» ещё не делает пункт ответом
+                if body_hits + section_hits >= 2:
+                    bonus += 5.0 * body_hits + 7.0 * section_hits
             if bonus:
                 scores[index] += bonus
         order = sorted(range(len(self.chunks)), key=lambda i: -scores[i])[:k]
@@ -812,6 +1090,11 @@ def relevant(question: str, results: list[dict]) -> list[dict]:
         return results
     kept = []
     for chunk in results:
+        # Не выбрасываем кандидатов с сильным бустом за номер/компанию:
+        # высокий score важнее лексического пересечения с длинным вопросом.
+        if float(chunk.get("score", 0) or 0) >= MIN_SCORE + 10:
+            kept.append(chunk)
+            continue
         have = significant_tokens(chunk["searchable"])
         if len(wanted & have) / len(wanted) >= 0.2:
             kept.append(chunk)
@@ -927,9 +1210,18 @@ def api_available() -> bool:
 
 
 _EMBEDDING_CACHE: dict[str, list[float]] = {}
+# 6 потоков одновременно увидят пустой кэш и отправят одни и те же чанки —
+# блокировка заставляет считать их один раз, остальные ждут готовое.
+_EMBEDDING_LOCK = threading.Lock()
 
 
 def _embed(client: httpx.Client, texts: list[str]) -> list[list[float]] | None:
+    """Потокобезопасный вход в кэш эмбеддингов."""
+    with _EMBEDDING_LOCK:
+        return _embed_serial(client, texts)
+
+
+def _embed_serial(client: httpx.Client, texts: list[str]) -> list[list[float]] | None:
     """Векторы через /embeddings, с кэшем и батчами по 64 текста."""
     result: list[list[float] | None] = [None] * len(texts)
     pending: list[tuple[int, str]] = []
@@ -963,6 +1255,19 @@ def _embed(client: httpx.Client, texts: list[str]) -> list[list[float]] | None:
     if any(vector is None for vector in result):
         return None
     return result  # type: ignore[return-value]
+
+
+def warm_embeddings(client: httpx.Client | None, chunks: list[dict]) -> int:
+    """Прогреть кэш векторов чанков ДО запуска ThreadPoolExecutor.
+
+    Иначе первые MAX_WORKERS потоков одновременно идут в /embeddings и
+    считают один и тот же корпус. После прогрева semantic_candidates берёт
+    готовые векторы из памяти.
+    """
+    if client is None or not chunks:
+        return 0
+    vectors = _embed(client, [chunk["searchable"][:1200] for chunk in chunks])
+    return len(vectors) if vectors else 0
 
 
 def semantic_candidates(
@@ -999,23 +1304,20 @@ def semantic_candidates(
 
 
 def reorder_by_embeddings(client: httpx.Client, question: str, chunks: list[dict]) -> list[dict]:
-    """Переупорядочить кандидатов по косинусной близости эмбеддингов."""
+    """Переупорядочить кандидатов по косинусной близости эмбеддингов.
+
+    Идём через общий `_embed`: векторы вопроса и уже встречавшихся чанков
+    берутся из кэша, а не запрашиваются повторно.
+    """
     if not chunks:
         return chunks
     try:
-        result = _post(client, "/embeddings", EMBED_KEY, {
-            "model": EMB_MODEL,
-            "input": [question] + [chunk["text"][:SNIPPET_CHARS] for chunk in chunks],
-            "encoding_format": "float",
-        })
-        vectors: list[list[float] | None] = [None] * (len(chunks) + 1)
-        for position, item in enumerate(result["data"]):
-            index = int(item.get("index", position))
-            vector = [float(x) for x in item["embedding"]]
-            norm = math.sqrt(sum(x * x for x in vector)) or 1.0
-            vectors[index] = [x / norm for x in vector]
-        if any(v is None for v in vectors):
-            raise ValueError("не все векторы получены")
+        texts = [question] + [
+            str(chunk.get("text") or "")[:SNIPPET_CHARS] for chunk in chunks
+        ]
+        vectors = _embed(client, texts)
+        if not vectors or len(vectors) != len(chunks) + 1:
+            return chunks
 
         query = vectors[0]
         scored = []
@@ -1029,43 +1331,92 @@ def reorder_by_embeddings(client: httpx.Client, question: str, chunks: list[dict
         return chunks
 
 
-def with_neighbours(selected: list[dict], all_chunks: list[dict], limit: int = 2) -> list[dict]:
-    """Добавить соседние пункты того же документа.
+def with_neighbours(
+    selected: list[dict],
+    all_chunks: list[dict],
+    limit: int = 3,
+    max_extra_chars: int = NEIGHBOUR_CHARS,
+) -> list[dict]:
+    """Добавить соседние пункты договора И соседние куски одной статьи закона.
 
-    Вопрос часто требует двух пунктов («плата И срок оплаты»), а поиск
-    приносит один. Соседи по номеру пункта закрывают такие случаи.
+    Для договоров работают числовые соседи (3.1 <-> 3.2). Для законов
+    статья может быть разбита на десятки кусков с одинаковыми doc + clause
+    («ст. 164»), поэтому подклеиваем соседний по порядку кусок статьи.
     """
-    if not selected:
+    if not selected or not all_chunks:
         return selected
 
     def numeric(clause: str) -> float | None:
         match = re.fullmatch(r"\d+(?:\.\d+)*", str(clause).strip())
         return float(match.group(0)) if match else None
 
+    def text_key(chunk: dict) -> tuple:
+        return (
+            chunk.get("doc"),
+            chunk.get("clause"),
+            str(chunk.get("text") or "")[:80],
+        )
+
     added: list[dict] = []
-    seen = {(chunk["doc"], chunk["clause"]) for chunk in selected}
+    extra_chars = 0
+    seen = {text_key(chunk) for chunk in selected}
+
+    # Позиция чанка в all_chunks: для закона нужен именно соседний по тексту
+    # кусок той же статьи, а не просто другой чанк с тем же clause.
+    pos_map = {text_key(chunk): index for index, chunk in enumerate(all_chunks)}
 
     for chunk in selected:
-        base = numeric(chunk["clause"])
+        if len(added) >= limit or extra_chars >= max_extra_chars:
+            break
+
+        clause = str(chunk.get("clause") or "")
+
+        # А) закон/статья: следующий или предыдущий кусок той же статьи
+        if chunk.get("doc_type") == "law" or clause.startswith("ст."):
+            index = pos_map.get(text_key(chunk))
+            if index is not None:
+                for step in (1, -1):
+                    neighbour_index = index + step
+                    if not (0 <= neighbour_index < len(all_chunks)):
+                        continue
+                    candidate = all_chunks[neighbour_index]
+                    key = text_key(candidate)
+                    if (
+                        candidate.get("doc") == chunk.get("doc")
+                        and candidate.get("clause") == chunk.get("clause")
+                        and key not in seen
+                        and extra_chars + len(str(candidate.get("text") or ""))
+                        <= max_extra_chars
+                    ):
+                        seen.add(key)
+                        added.append(candidate)
+                        extra_chars += len(str(candidate.get("text") or ""))
+                        break
+            continue
+
+        # Б) договор/регламент: числовой сосед 3.1 <-> 3.2
+        base = numeric(clause)
         if base is None:
             continue
         for candidate in all_chunks:
-            if len(added) >= limit:
+            if len(added) >= limit or extra_chars >= max_extra_chars:
                 break
-            if candidate["doc"] != chunk["doc"]:
+            if candidate.get("doc") != chunk.get("doc"):
                 continue
-            value = numeric(candidate["clause"])
+            value = numeric(candidate.get("clause"))
             if value is None:
                 continue
-            key = (candidate["doc"], candidate["clause"])
+            key = text_key(candidate)
             if key in seen:
                 continue
-            if abs(value - base) <= 0.11:      # соседний пункт: 3.1 <-> 3.2
-                seen.add(key)
-                added.append(candidate)
+            if abs(value - base) <= 0.11:
+                size = len(str(candidate.get("text") or ""))
+                if extra_chars + size <= max_extra_chars:
+                    seen.add(key)
+                    added.append(candidate)
+                    extra_chars += size
 
     return selected + added
-
 
 def rerank_chunks(client: httpx.Client, question: str, chunks: list[dict]) -> list[dict]:
     """Финальный отбор через /rerank."""
@@ -1097,15 +1448,18 @@ def rerank_chunks(client: httpx.Client, question: str, chunks: list[dict]) -> li
 SYSTEM_PROMPT = (
     "Ты юридический ассистент компании. Отвечай ТОЛЬКО по фрагментам документов из блока КОНТЕКСТ.\n"
     "\n"
-    "ФОРМАТ ОТВЕТА: 2-4 предложения (150-400 символов). Начни с прямого ответа: «Да», «Нет» или сам факт.\n"
+    "ФОРМАТ ОТВЕТА: 2-5 предложений, обычно 300-550 символов. Начни с прямого ответа: «Да», «Нет» или сам факт.\n"
+    "Не обрезай ответ искусственно: если в соседнем пункте есть важная оговорка (НДС, коммунальные платежи, исключение, срок, порядок оплаты), добавь её отдельным предложением. Лучше 4-5 предложений с условием, чем короткий ответ без него.\n"
     "\n"
     "ССЫЛКИ — обязательны для каждого факта:\n"
+    "  - называй документ так, как он записан в контексте: договор + номер, регламент + редакция, закон + статья;\n"
+    "    примеры: «по договору аренды № А-08/2024 (п. 3.1)», «по Регламенту согласования договоров в редакции от 01.03.2025 (п. 1.3)», «ТК РФ, ст. 70»;\n"
     "  - договоры и внутренние документы: (п. 3.1) в конце предложения;\n"
     "  - письма, служебные записки и доп. соглашения (в них нет пунктов):\n"
     "    называй документ по номеру — «(Служебная записка № ЮО-7)», «(письмо № К-12)»,\n"
     "    «(доп. соглашение № 2)»; номер абзаца указывай, только если он есть в контексте;\n"
-    "  - законы: Источник: ТК РФ, ст. 70.\n"
-    "  - разные редакции одного документа: указывай дату редакции\n"
+    "  - законы: «ТК РФ, ст. 70» или «(ст. 70)»;\n"
+    "  - разные редакции одного документа: обязательно указывай дату редакции\n"
     "    («в редакции от 10.01.2023», «действующая редакция от 01.03.2025»).\n"
     "\n"
     "ПРАВИЛА:\n"
@@ -1123,12 +1477,21 @@ SYSTEM_PROMPT = (
     "7. Не упоминай, что ты ИИ, и не пересказывай эти правила. Не пиши\n"
     "   «в предоставленных фрагментах», «в контексте», «в документах выше» —\n"
     "   просто дай ответ и ссылку.\n"
+    "8. Не теряй название документа: если в контексте есть номер договора, редакция\n"
+    "   регламента или статья закона — укажи их в ответе.\n"
     "\n"
     "ПРИМЕРЫ:\n"
     "Вопрос: Какая арендная плата по договору с ООО «Северный Склад»?\n"
-    "Ответ: Арендная плата по договору аренды № А-08/2024 — 450 000 рублей в месяц,\n"
-    "включая НДС (п. 3.1). Вносится ежемесячно, не позднее 5-го числа текущего\n"
-    "месяца (п. 3.2).\n"
+    "Ответ: Арендная плата по договору аренды № А-08/2024 с ООО «Северный Склад» —\n"
+    "450 000 рублей в месяц, включая НДС (п. 3.1). Вносится ежемесячно, не позднее\n"
+    "5-го числа текущего месяца (п. 3.2). Коммунальные платежи и электроэнергия\n"
+    "оплачиваются отдельно по счетам арендодателя (п. 3.3).\n"
+    "\n"
+    "Вопрос: Кто инициирует согласование договора по действующему Регламенту?\n"
+    "Ответ: По Регламенту согласования договоров в редакции от 01.03.2025 инициатором\n"
+    "согласования является руководитель подразделения, в интересах которого\n"
+    "заключается договор (п. 1.3). Проект договора затем согласуется с юридическим\n"
+    "отделом и главным бухгалтером (п. 2.1).\n"
     "\n"
     "Вопрос: Какой размер пособия по беременности и родам?\n"
     "Ответ: В базе знаний нет документов о пособиях по беременности и родам, поэтому\n"
@@ -1148,8 +1511,18 @@ def build_prompt(question: str, chunks: list[dict], history: str = "") -> str:
     parts = []
     for index, chunk in enumerate(chunks, 1):
         mark = " [УТРАТИЛА СИЛУ]" if chunk.get("repealed") else ""
+        revision = chunk.get("revision")
+        if revision and f"ред. {revision}" not in str(chunk.get("doc") or "").lower():
+            mark += f" [ред. {revision}]"
+        clause = str(chunk.get("clause") or "без пункта")
+        # для закона «п. ст. 70» — бессмысленный дубль префикса
+        if clause.startswith(("ст.", "абз.")):
+            where = clause
+        else:
+            where = f"п. {clause}"
         section = chunk.get("section")
-        where = f"раздел «{section}», п. {chunk['clause']}" if section else f"п. {chunk['clause']}"
+        if section:
+            where = f"раздел «{section}», {where}"
         parts.append(f"[{index}] «{chunk['doc']}», {where}{mark}\n{chunk['text']}")
     history_section = f"\n\nИСТОРИЯ ДИАЛОГА:\n{history}" if history.strip() else ""
     return ("КОНТЕКСТ:\n" + "\n\n".join(parts) + history_section
@@ -1181,42 +1554,164 @@ def split_dialog(raw: str) -> tuple[str, str]:
     return " ".join(history_parts[:-1]), (last_user or raw.strip())
 
 
-def _grounded(answer: str, chunks: list[dict]) -> bool:
+# Числительные, которые модель может писать словами: «три дня» = «3 дня».
+NUM_WORDS = {
+    "один": 1, "одна": 1, "одно": 1, "одного": 1, "одной": 1, "одному": 1, "одну": 1,
+    "два": 2, "две": 2, "двух": 2, "двум": 2, "двумя": 2,
+    "три": 3, "трех": 3, "трем": 3, "тремя": 3,
+    "четыре": 4, "четырех": 4, "четырем": 4, "четырьмя": 4,
+    "пять": 5, "пяти": 5, "пятью": 5,
+    "шесть": 6, "шести": 6, "шестью": 6,
+    "семь": 7, "семи": 7, "семью": 7,
+    "восемь": 8, "восьми": 8, "восемью": 8,
+    "девять": 9, "девяти": 9, "девятью": 9,
+    "десять": 10, "десяти": 10, "десятью": 10,
+    "одиннадцать": 11, "одиннадцати": 11,
+    "двенадцать": 12, "двенадцати": 12,
+    "тринадцать": 13, "тринадцати": 13,
+    "четырнадцать": 14, "четырнадцати": 14,
+    "пятнадцать": 15, "пятнадцати": 15,
+    "двадцать": 20, "двадцати": 20,
+    "тридцать": 30, "тридцати": 30,
+}
+
+# В num — только известные числительные или цифры: иначе «в течение трёх
+# рабочих дней» парсится как пара («течение», «трёх») и число теряется.
+NUM_WORD_PATTERN = "|".join(
+    re.escape(word) for word in sorted(NUM_WORDS, key=len, reverse=True)
+)
+UNIT_TERM_RE = re.compile(
+    rf"(?<![\d.,])(?P<num>\d+|{NUM_WORD_PATTERN})\s+"
+    r"(?:(?:рабоч|календарн)[а-яё]*\s+)?"
+    r"(?P<unit>[а-яё]+)",
+    re.I,
+)
+
+
+def _unit_kind(raw: str) -> str:
+    raw = raw.lower().replace("ё", "е")
+    if raw.startswith(("дн", "ден")):
+        return "дн"
+    if raw.startswith("месяц"):
+        return "мес"
+    if raw.startswith("год") or raw == "лет":
+        return "год"
+    if raw.startswith("час"):
+        return "час"
+    if raw.startswith("недел"):
+        return "нед"
+    return ""
+
+
+def _unit_terms(text: str) -> set[tuple[int, str]]:
+    """Числа с единицами: (3, 'дн'), (30, 'мес')."""
+    found: set[tuple[int, str]] = set()
+    low = text.lower().replace("ё", "е")
+    for match in UNIT_TERM_RE.finditer(low):
+        raw_num = match.group("num")
+        value = int(raw_num) if raw_num.isdigit() else NUM_WORDS.get(raw_num)
+        unit = _unit_kind(match.group("unit"))
+        if value is not None and unit:
+            found.add((value, unit))
+    return found
+
+
+def _grounded(answer: str, chunks: list[dict], question: str = "") -> bool:
     """Проверка, что ответ не выдумывает: ссылки и цифры есть в контексте.
 
     По регламенту выдуманный факт обнуляет вопрос, поэтому лучше отдать
     цитату из документа, чем красивый, но непроверяемый ответ.
+
+    Числа из вопроса тоже считаются допустимыми: по правилу №3 модель должна
+    уметь поправить «450 000, а не 500 000», где 500 000 нет в документах.
     """
     # в проверку включаем и шапку: модель цитирует номер пункта из неё,
     # а не обязательно из текста
     context = " ".join(
         f"{chunk['doc']} {chunk['clause']} {chunk['text']}" for chunk in chunks
     ).lower()
-    context_digits = re.sub(r"\s+", "", context)
-    answer_digits = re.sub(r"\s+", "", answer)
+    # Копейки не должны мешать сравнению: «450 000,00» и «450 000» — одна
+    # сумма. Нормализуем и ответ, и контекст, иначе .00 остаётся в цифрах.
+    context_normalized = re.sub(r"([.,]00)\b", "", context)
+    # Сравниваем номера как множество, а не подстрокой: «450 000» не должен
+    # подтверждаться «4 500 000».
+    context_numbers = {
+        re.sub(r"\D", "", number)
+        for number in re.findall(r"\d[\d\s]{2,}", context_normalized)
+    }
+    context_numbers = {number for number in context_numbers if len(number) >= 3}
+    # Числа из вопроса разрешены: модель может их цитировать, чтобы
+    # исправить («составляет 450 000, а не 500 000»).
+    question_normalized = re.sub(r"([.,]00)\b", "", question.lower())
+    question_numbers = {
+        re.sub(r"\D", "", number)
+        for number in re.findall(r"\d[\d\s]{2,}", question_normalized)
+    }
+    allowed_numbers = context_numbers | {
+        number for number in question_numbers if len(number) >= 3
+    }
 
     # 1) все номера пунктов/статей из ответа должны существовать в контексте
     for clause in re.findall(r"п\.?\s*(\d+(?:\.\d+)+)", answer):
-        if clause in context or f"п. {clause}" in context:
+        # границы числа: «3.1» не должен подтверждаться «3.10» или «13.1»
+        if re.search(rf"(?<!\d){re.escape(clause)}(?!\d)", context):
             continue
         # «3.1.1» может прийти из нарезки, где сохранён только «3.1»
         parts = clause.split(".")
         if len(parts) >= 3:
             parent = ".".join(parts[:2])
-            if parent in context:
+            if re.search(rf"(?<!\d){re.escape(parent)}(?!\d)", context):
                 continue
         return False
-    for para in re.findall(r"абз\.?\s*(\d+)", answer):
-        if f"абз. {para}" not in context:
+    for para in re.findall(r"(?:абз\.?|абзац[а-яё]*)\s*(\d+)", answer, re.I):
+        if not re.search(
+            rf"(?:абз\.?|абзац[а-яё]*)\s*{re.escape(para)}(?!\d)", context, re.I
+        ):
             return False
-    for article in re.findall(r"ст\.?\s*(\d+)", answer):
-        if article not in context and f"статья {article}" not in context:
+    for article in re.findall(r"(?:ст\.|стать[а-яё]*)\s*(\d+)", answer, re.I):
+        # не любое «70» в контексте, а именно ссылка на статью 70
+        if not re.search(
+            rf"(?:ст\.|стать[а-яё]*)\s*{re.escape(article)}(?!\d)", context, re.I
+        ):
             return False
 
-    # 2) крупные числа из ответа должны встречаться в документах
-    for number in re.findall(r"\d[\d\s]{2,}", answer):
+    # 2) числа из ответа должны встречаться в документах отдельным числом
+    # (не подстрокой). Убираем копейки: «450 000,00» -> «450 000».
+    answer_numbers = re.sub(r"([.,]00)\b", "", answer)
+    for number in re.findall(r"\d[\d\s]{2,}", answer_numbers):
         clean = re.sub(r"\D", "", number)
-        if len(clean) >= 4 and clean not in context_digits:
+        if len(clean) >= 3 and clean not in allowed_numbers:
+            return False
+
+    # 2b) сроки с единицами: «3 дня» != «30 дней». Проверяем только если в
+    # контексте вообще есть такие числа, и разрешаем числа из вопроса.
+    context_terms = _unit_terms(context_normalized)
+    if context_terms:
+        allowed_terms = context_terms | _unit_terms(question_normalized)
+        for term in _unit_terms(answer_numbers):
+            if term not in allowed_terms:
+                return False
+
+    # 2a) проценты — отдельно: короткое «7%» не попадало в проверку выше и
+    # могло подтверждаться «6%» из документа. Проценты из вопроса тоже
+    # допустимы: модель может исправлять неверную цифру из вопроса.
+    def canonical(raw: str) -> str:
+        value = raw.replace(",", ".")
+        if "." in value:
+            value = value.rstrip("0").rstrip(".")
+        return value
+
+    question_percents = {
+        canonical(raw)
+        for raw in re.findall(r"(\d+(?:[.,]\d+)?)\s*%", question_normalized)
+    }
+    for raw in re.findall(r"(\d+(?:[.,]\d+)?)\s*%", answer_numbers):
+        if canonical(raw) in question_percents:
+            continue
+        pattern = re.escape(raw).replace(",", "[.,]").replace(r"\.", "[.,]")
+        if not re.search(
+            rf"(?<!\d){pattern}(?:[.,]0+)?\s*(?:%|процент)", context, re.I
+        ):
             return False
 
     return True
@@ -1388,8 +1883,12 @@ def _pick_sentences(chunk: dict, wanted: set[str], limit: int = 320,
     return " ".join(picked).strip()
 
 
-def extractive_answer(question: str, chunks: list[dict]) -> str:
-    wanted = significant_tokens(question)
+def extractive_answer(question: str, chunks: list[dict], search_query: str = "") -> str:
+    # Для диалога важны слова из истории, иначе «А за сколько дней?» выбирает
+    # предложение без темы договора. Оценку «это вопрос про сумму/срок?»
+    # оставляем по последней реплике.
+    token_source = search_query or question
+    wanted = significant_tokens(token_source)
     ask_value = wants_value(question)
     candidates = chunks[:2]
     if ask_value and not asks_timing(question):
@@ -1409,10 +1908,13 @@ def extractive_answer(question: str, chunks: list[dict]) -> str:
             parts.append(f"{text} {_citation(chunk)}")
     return " ".join(parts) if parts else REFUSAL
 
-
 def _ensure_citation(text: str, chunks: list[dict]) -> str:
     """Без ссылки на пункт ответ для судьи слабее — дописываем свою."""
-    if re.search(r"(п\.|пункт|ст\.|статья|ч\.|абз\.|абзац)\s*\d", text, re.I):
+    if re.search(
+        r"(?<![а-яёa-z])(?:п\.?|пункт[а-яё]*|ст\.?|стать[а-яё]*|ч\.?|абз\.?|абзац[а-яё]*)\s*\d",
+        text,
+        re.I,
+    ):
         return text
     # письма и записки цитируют номером документа: «№ ЮО-7», «№ К-12»
     if re.search(r"№\s*[А-ЯA-Z]{1,4}[-\s]?\d", text):
@@ -1421,22 +1923,29 @@ def _ensure_citation(text: str, chunks: list[dict]) -> str:
 
 
 def _second_pass(
-    client: httpx.Client, question: str, retriever: Retriever, first_selected: list[dict]
+    client: httpx.Client, question: str, retriever: Retriever, first_selected: list[dict],
+    search_query: str = "",
 ) -> list[dict]:
     """Повторный поиск, если первый контекст не дал ответа.
 
     К запросу добавляем слова из названия найденного документа — так
-    находятся пункты, сформулированные иначе, чем вопрос.
+    находятся пункты, сформулированные иначе, чем вопрос. Для уточняющих
+    вопросов поиск идёт по search_query (история + последняя реплика), а не
+    по голому «А за сколько дней после поставки?».
     """
+    query = search_query or question
     extra = ""
     if first_selected:
         title_words = [w for w in first_selected[0]["doc"].split() if len(w) > 3]
         extra = " ".join(title_words[:6])
 
-    wider = f"{expand_query(question)} {extra}".strip()
-    candidates = [c for c in retriever.search(wider, TOP_K * 2) if c["score"] > 0]
+    wider = f"{expand_query(query)} {extra}".strip()
+    candidates = [
+        c for c in retriever.search(wider, TOP_K * 2, topic_query=question)
+        if c["score"] > 0
+    ]
 
-    semantic, _ = semantic_candidates(client, question, retriever, k=TOP_K)
+    semantic, _ = semantic_candidates(client, query, retriever, k=TOP_K)
     seen = {(c["doc"], c["clause"]) for c in candidates}
     for chunk in semantic:
         if (chunk["doc"], chunk["clause"]) not in seen:
@@ -1444,8 +1953,8 @@ def _second_pass(
 
     if not candidates:
         return []
-    ordered = reorder_by_embeddings(client, question, candidates[:TOP_K * 2])
-    return rerank_chunks(client, question, ordered)
+    ordered = reorder_by_embeddings(client, query, candidates[:TOP_K * 2])
+    return rerank_chunks(client, query, ordered)
 
 
 def answer_question(
@@ -1453,15 +1962,27 @@ def answer_question(
     question: str,
     retriever: Retriever,
     history: str = "",
+    search_query: str = "",
 ) -> str:
-    search_text = expand_query(question)
-    candidates = [chunk for chunk in retriever.search(search_text) if chunk["score"] >= MIN_SCORE]
+    """Ответ на question; поиск — по search_query (обычно история + вопрос).
+
+    question остаётся только для генерации и экстрактивного ответа: на
+    «А за сколько дней после поставки?» модель должна ответить на уточнение,
+    но искать нужно с названием договора из предыдущей реплики.
+    """
+    # Если вызывающая сторона не передала склейку, собираем её сами.
+    query = search_query or (f"{history} {question}".strip() if history else question)
+    search_text = expand_query(query)
+    candidates = [
+        chunk for chunk in retriever.search(search_text, topic_query=question)
+        if chunk["score"] >= MIN_SCORE
+    ]
 
     # гибрид: добавляем кандидатов, найденных по смыслу (независимо от слов)
     semantic: list[dict] = []
     semantic_best = 0.0
     if api_available():
-        semantic, semantic_best = semantic_candidates(client, question, retriever)
+        semantic, semantic_best = semantic_candidates(client, query, retriever)
 
     if semantic:
         seen = {(chunk["doc"], chunk["clause"]) for chunk in candidates}
@@ -1471,12 +1992,12 @@ def answer_question(
 
     # Оба сигнала слабые — значит по базе ответить нечем. Честный отказ
     # совпадает с golden там, где данных действительно нет.
-    best_word_score = max((c["score"] for c in candidates if c["score"] <= 60), default=0.0)
+    best_word_score = max((c["score"] for c in candidates), default=0.0)
     if not candidates or (best_word_score < MIN_SCORE and semantic_best < SEMANTIC_STRICT):
         DEGRADE["нет_данных" if api_available() else "нет_api"] += 1
         return REFUSAL
 
-    filtered = relevant(question, candidates)
+    filtered = relevant(query, candidates)
     if len(filtered) >= 3:
         candidates = filtered
 
@@ -1487,8 +2008,8 @@ def answer_question(
         return REFUSAL
 
     if api_available() and time.time() - RUN_STARTED < DEADLINE_SECONDS:
-        ordered = reorder_by_embeddings(client, question, candidates)
-        selected = rerank_chunks(client, question, ordered)
+        ordered = reorder_by_embeddings(client, query, candidates)
+        selected = rerank_chunks(client, query, ordered)
 
         # реранкер может «потерять» нужный пункт: добавляем лучшие по словам,
         # которых в его списке нет
@@ -1523,40 +2044,44 @@ def answer_question(
             # LLM не ответила: пробуем второй поиск — возможно, дело в контексте
             DEGRADE["llm_упал"] += 1
             if time.time() - RUN_STARTED < DEADLINE_SECONDS * 0.9:
-                retry_selected = _second_pass(client, question, retriever, selected)
+                retry_selected = _second_pass(
+                    client, question, retriever, selected, search_query=query
+                )
                 if retry_selected:
                     second = ask_llm(client, question, retry_selected, history)
                     if second:
                         second = _ensure_citation(second, retry_selected)
-                        if _grounded(second, retry_selected) and not INSUFFICIENT.search(second):
+                        if _grounded(second, retry_selected, question) and not INSUFFICIENT.search(second):
                             ANSWER_STATS["вторая_попытка"] += 1
                             return second
 
         if text:
             text = _ensure_citation(text, selected)
-            if _grounded(text, selected) and not INSUFFICIENT.search(text):
+            if _grounded(text, selected, question) and not INSUFFICIENT.search(text):
                 ANSWER_STATS["модель"] += 1
                 return text
 
             # Первый контекст не дал ответа — пробуем найти другие документы.
             if time.time() - RUN_STARTED < DEADLINE_SECONDS * 0.9:
-                retry_selected = _second_pass(client, question, retriever, selected)
+                retry_selected = _second_pass(
+                    client, question, retriever, selected, search_query=query
+                )
                 if retry_selected:
                     second = ask_llm(client, question, retry_selected, history)
                     if second:
                         second = _ensure_citation(second, retry_selected)
-                        if _grounded(second, retry_selected) and not INSUFFICIENT.search(second):
+                        if _grounded(second, retry_selected, question) and not INSUFFICIENT.search(second):
                             ANSWER_STATS["вторая_попытка"] += 1
                             return second
 
-            if _grounded(text, selected):
+            if _grounded(text, selected, question):
                 ANSWER_STATS["модель"] += 1
                 return text
             DEGRADE["не_подтверждён"] += 1
 
     # Отказ судья оценивает как «хуже baseline». Поэтому если хоть что-то
     # нашлось — отдаём обоснованную цитату, а не молчим.
-    return extractive_answer(question, candidates)
+    return extractive_answer(question, candidates, search_query=query)
 
 
 # ─────────────────────── main ───────────────────────
@@ -1596,6 +2121,11 @@ def main() -> None:
     answers: list[str] = [REFUSAL] * len(rows)
 
     shared_client = make_client() if api_available() else None
+    # прогрев до ThreadPoolExecutor: иначе 6 потоков дублируют эмбеддинги
+    # всего корпуса (6 × 324 запроса вместо 6 батчей)
+    warmed = warm_embeddings(shared_client, chunks)
+    if warmed:
+        print(f"[DIAG] эмбеддинги чанков прогреты: {warmed}", flush=True)
 
     def work(position: int, question: str) -> tuple[int, str]:
         if not question:
@@ -1607,12 +2137,16 @@ def main() -> None:
         try:
             # поиск — по склейке (нужен контекст), ответ — по последней реплике
             # плюс отдельный блок истории для модели
-            return position, answer_question(shared_client, last_question, retriever, history)
+            return position, answer_question(
+                shared_client, last_question, retriever, history, search_text
+            )
         except Exception as exc:
             DEGRADE["исключение"] += 1
             print(f"вопрос {position}: {type(exc).__name__}: {exc}", file=sys.stderr)
             try:
-                return position, extractive_answer(question, retriever.search(question))
+                return position, extractive_answer(
+                    last_question, retriever.search(search_text), search_text
+                )
             except Exception:
                 return position, REFUSAL
 

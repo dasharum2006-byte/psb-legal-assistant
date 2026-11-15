@@ -2,6 +2,7 @@
 from contextlib import asynccontextmanager
 import hashlib
 import json
+import os
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -73,6 +74,25 @@ async def lifespan(app: FastAPI):
         app.state.index_error = None
         logger.info("Index loaded successfully")
 
+        # Прогрев эмбеддингов до первых запросов: иначе несколько потоков
+        # одновременно считают одни и те же чанки. Без ключей — no-op.
+        app.state.embeddings_warmed = 0
+        if os.getenv("WARM_EMBEDDINGS", "1") != "0":
+            try:
+                from app.rag import semantic
+
+                app.state.embeddings_warmed = semantic.warm_embeddings(
+                    rag_retriever.all_chunks()
+                )
+                if app.state.embeddings_warmed:
+                    logger.info(
+                        "EMBEDDINGS_WARMED: %s", app.state.embeddings_warmed
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "EMBEDDINGS_WARM_FAILED: %s: %s", type(exc).__name__, exc
+                )
+
     except Exception as e:
         app.state.retriever = None
         app.state.index_error = str(e)
@@ -95,6 +115,19 @@ app.include_router(chat_router, prefix="/api", tags=["chat"])
 app.include_router(documents_router, prefix="/api", tags=["documents"])
 
 
+def _retrieval_state() -> dict:
+    """Какие сигналы поиска реально включены (без сетевых запросов)."""
+    try:
+        from app.rag import semantic
+
+        return {
+            "embeddings": semantic.embeddings_available(),
+            "rerank": semantic.rerank_available(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 @app.get("/api/health")
 def health():
     retriever = getattr(app.state, "retriever", None)
@@ -108,6 +141,8 @@ def health():
             "index": "loaded",
             "orchestrator": orchestrator,
             "index_stale": getattr(app.state, "index_stale", None),
+            "retrieval": _retrieval_state(),
+            "embeddings_warmed": getattr(app.state, "embeddings_warmed", 0),
             "version": "0.1.0",
         }
 
@@ -115,6 +150,8 @@ def health():
         "status": "degraded",
         "index": None,
         "orchestrator": orchestrator,
+        "retrieval": _retrieval_state(),
+        "embeddings_warmed": getattr(app.state, "embeddings_warmed", 0),
         "error": str(error_msg),
         "hint": "Run 'python scripts/build_index.py' and restart server"
     }

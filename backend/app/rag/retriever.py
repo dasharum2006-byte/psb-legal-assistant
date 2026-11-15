@@ -11,8 +11,40 @@ import re
 
 try:  # запуск из backend/ (uvicorn, pytest)
     from app.rag.normalize import stem
+    from app.rag.metadata import (
+        CLAUSE_REF_RE,
+        DOC_NUMBER_RE,
+        TITLE_STOPWORDS,
+        common_quoted_names,
+        exact_mention_boost,
+        foreign_name_penalty,
+        has_past_year,
+        metadata_boost,
+        question_clause_refs,
+        question_doc_numbers,
+        question_names,
+        relevant_quoted_names,
+        repealed_penalty,
+        title_keywords,
+    )
 except ModuleNotFoundError:  # запуск из корня репозитория (scripts/build_index.py)
     from backend.app.rag.normalize import stem
+    from backend.app.rag.metadata import (
+        CLAUSE_REF_RE,
+        DOC_NUMBER_RE,
+        TITLE_STOPWORDS,
+        common_quoted_names,
+        exact_mention_boost,
+        foreign_name_penalty,
+        has_past_year,
+        metadata_boost,
+        question_clause_refs,
+        question_doc_numbers,
+        question_names,
+        relevant_quoted_names,
+        repealed_penalty,
+        title_keywords,
+    )
 import os
 import json
 
@@ -30,78 +62,50 @@ def tokenize(text: str) -> list[str]:
     text = re.sub(r"[^а-яa-z0-9\s]", " ", text)
     return [stem(word) for word in text.split() if len(word) > 1]
 
+
+# Служебные слова шапки: есть почти в каждом пункте и не должны считаться
+# смыслом вопроса.
+META_NOISE_TOKENS = set(tokenize("договор поставка аренда регламент записка письмо ооо"))
+_body_tokens: list[set[str]] = []
+_section_tokens: list[set[str]] = []
+_common_names: set[str] = set()
+
+
+def _refresh_token_cache() -> None:
+    global _body_tokens, _section_tokens, _common_names
+    _body_tokens = [set(tokenize(str(c.get("text") or ""))) for c in _chunks_store]
+    _section_tokens = [set(tokenize(str(c.get("section") or ""))) for c in _chunks_store]
+    _common_names = common_quoted_names(_chunks_store)
+
+
+def _last_user_message(text: str) -> str:
+    """Последняя реплика пользователя, если пришла история диалога."""
+    parts = re.split(r"(?i)(пользователь|ассистент)\s*:", text)
+    last = text
+    for index in range(1, len(parts) - 1, 2):
+        if parts[index].lower() == "пользователь" and parts[index + 1].strip():
+            last = parts[index + 1].strip()
+    return last
+
+
+def all_chunks() -> list[dict]:
+    """Все чанки индекса для независимого семантического поиска.
+
+    BM25 отдаёт только top-k, поэтому перефразированный пункт, которого нет
+    в этом top-k, иначе не увидит ни эмбеддинг, ни реранкер. Возвращаем копию
+    списка (dict'ы не копируем глубоко: semantic их не меняет).
+    """
+    return list(_chunks_store)
+
+
 def build_index(chunks: list[dict]):
     global _bm25_index, _chunks_store
     _chunks_store = chunks
     tokenized_corpus = [tokenize(chunk.get('searchable', chunk['text'])) for chunk in _chunks_store]
     # пустой корпус — валидное состояние (архив не прочитался), BM25 на нём падает
     _bm25_index = BM25Okapi(tokenized_corpus) if tokenized_corpus else None
+    _refresh_token_cache()
     print(f"Индекс ВМ25 построен на {len(chunks)} чанках")
-
-# Номера документов: «А-08/2024», «П-17/2024», «ПТ-05/2023», «ЮО-7», «К-12».
-# Общая схема, а не список известных договоров: работает и на приватном наборе.
-DOC_NUMBER_RE = re.compile(r"(?<![а-яa-z0-9])([а-я]{1,4})[-‑](\d{1,4})(?:/(\d{4}))?", re.I)
-# Ссылки на статью или пункт: «ст. 70», «статья 70», «п. 3.1».
-CLAUSE_REF_RE = re.compile(r"(?:ст\.|стать[яию]|п\.|пункт)\s*(\d+(?:\.\d+)*)", re.I)
-
-# Слова, которые есть почти в любом заголовке и ничего не различают
-TITLE_STOPWORDS = {
-    "служебная", "записка", "письмо", "исходящее", "договор", "поставки",
-    "аренды", "нежилого", "помещения", "соглашение", "дополнительное",
-    "общество", "ограниченной", "ответственностью", "между", "номер",
-    "российской", "федерации", "статья", "глава",
-}
-
-
-def question_doc_numbers(text: str) -> set[str]:
-    """Номера документов, упомянутые в вопросе («а-08/2024», «юо-7»)."""
-    found = set()
-    for letter, digits, year in DOC_NUMBER_RE.findall(text):
-        found.add(f"{letter}-{digits}".lower())
-        if year:
-            found.add(f"{letter}-{digits}/{year}".lower())
-    return found
-
-
-def question_clause_refs(text: str) -> set[str]:
-    """Ссылки на статью/пункт из вопроса («70», «3.1»)."""
-    return {match.group(1) for match in CLAUSE_REF_RE.finditer(text)}
-
-
-def title_keywords(text: str) -> set[str]:
-    return {
-        word for word in re.findall(r"[а-яa-z]{5,}", text.lower().replace("ё", "е"))
-        if word not in TITLE_STOPWORDS
-    }
-
-
-def metadata_boost(query: str, chunk: dict) -> float:
-    """Бонус за совпадение метаданных: номер документа и ссылка на пункт.
-
-    Без него нужный пункт остаётся на 15-25 месте: BM25 не знает, что
-    «П-17/2024» в вопросе и в заголовке — одно и то же.
-    """
-    bonus = 0.0
-    numbers = question_doc_numbers(query)
-    refs = question_clause_refs(query)
-
-    chunk_number = str(chunk.get("number") or "").lower().replace("№", "").strip()
-    haystack = f"{chunk_number} {chunk.get('doc_id', '')} {chunk.get('doc', '')}".lower().replace("/", "-")
-
-    for number in numbers:
-        flat = number.replace("/", "-")
-        if flat and flat in haystack:
-            bonus += 15.0
-            break
-    if refs:
-        clause = str(chunk.get("clause") or "").lower()
-        core = clause.replace("ст.", "").replace("п.", "").strip()
-        if core and any(ref == core or core.startswith(ref + ".") for ref in refs):
-            bonus += 10.0
-
-    matched = title_keywords(query) & title_keywords(str(chunk.get("doc") or ""))
-    bonus += 3.0 * len(matched)
-    return bonus
 
 
 QUERY_SYNONYMS = {
@@ -126,6 +130,8 @@ QUERY_SYNONYMS = {
     "выдач": "выдава оригинал архив",
     "претенз": "претензи акт недостатк",
     "недостат": "дефект претензи качеств",
+    "инициатор": "запуст согласован",
+    "запуст": "инициатор согласован",
     # «сдать ключи» -> «вернуть помещение по акту»
     "сда": "возврат передач акт",
     "ключ": "доступ помещен",
@@ -163,9 +169,32 @@ def search(query: str, k: int = 8) -> list[dict]:
     tokenized_query = tokenize(expand_query(query_clean))
     scores = list(_bm25_index.get_scores(tokenized_query))
 
-    # общие бусты по метаданным: номер документа и ссылка на статью/пункт
+    # общие бусты по метаданным: номер документа, точное название,
+    # ссылка на статью/пункт; штрафы за чужую компанию и старую редакцию
+    relevant_names = relevant_quoted_names(query, _chunks_store, _common_names)
+    if len(_body_tokens) != len(_chunks_store):
+        _refresh_token_cache()
+
+    # Смысловые слова — из последней реплики пользователя, без шапки и
+    # названий документов, иначе «договор»/«аренда» поднимают случайные пункты.
+    topic_text = expand_query(_last_user_message(query))
+    quoted_tokens: set[str] = set()
+    for name in question_names(query):
+        quoted_tokens |= set(tokenize(name))
+    topic_tokens = set(tokenize(topic_text)) - quoted_tokens - META_NOISE_TOKENS
+
     for index, chunk in enumerate(_chunks_store):
-        bonus = metadata_boost(query, chunk)
+        bonus = (
+            metadata_boost(query, chunk)
+            + repealed_penalty(query, chunk)
+            + foreign_name_penalty(query, chunk, relevant_names)
+        )
+        if topic_tokens:
+            body_hits = len(_body_tokens[index] & topic_tokens)
+            section_hits = len(_section_tokens[index] & topic_tokens)
+            # одно общее слово вроде «размер» ещё не делает пункт ответом
+            if body_hits + section_hits >= 2:
+                bonus += 5.0 * body_hits + 7.0 * section_hits
         if bonus:
             scores[index] += bonus
 
@@ -236,5 +265,6 @@ def load_index_from_disk(index_dir: str = "data/index"):
     tokenized_corpus = [tokenize(chunk.get('searchable', chunk['text'])) for chunk in _chunks_store]
     # пустой корпус — валидное состояние (архив не прочитался), BM25 на нём падает
     _bm25_index = BM25Okapi(tokenized_corpus) if tokenized_corpus else None
+    _refresh_token_cache()
     print(f"✅ Индекс загружен с диска: {len(_chunks_store)} чанков")
 
