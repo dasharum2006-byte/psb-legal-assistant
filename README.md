@@ -50,7 +50,10 @@ docker compose up --build   # backend :8000, frontend :3000
 ### Локальный запуск (без Docker)
 
 ```bash
-cd backend && pip install -r requirements.txt && uvicorn app.main:app --reload
+# Терминал 1: бэкенд на http://localhost:8000
+cd backend && pip install -r requirements.txt && uvicorn app.main:app --env-file ../.env --reload
+
+# Терминал 2: фронтенд на http://localhost:5173
 cd frontend && npm install && npm run dev
 ```
 
